@@ -1,0 +1,14 @@
+[package]
+name = "int8bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Benchmark: int8/int4 expert-FFN kernel throughput on CPUs without AVX (e.g. Intel N5105)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

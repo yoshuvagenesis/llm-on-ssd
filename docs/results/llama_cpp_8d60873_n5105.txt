@@ -1,0 +1,21 @@
+llama.cpp build 8d60873, built in Docker with -DGGML_NATIVE=ON, on the same Intel N5105 NAS.
+Command: llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -p 512 -n 128 -t 4 -r 1
+Each run in a container: --memory 7g --memory-swap 7g / --memory 6g --memory-swap 6g / no limit (12 GB machine).
+
+== 7 GB limit
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           pp512 |          2.69 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           tg128 |          0.57 ± 0.00 |
+
+== 6 GB limit
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           pp512 |          2.69 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           tg128 |          0.43 ± 0.00 |
+
+== no limit (all of the machine's 12 GB)
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           pp512 |          2.62 ± 0.00 |
+| qwen3moe 30B.A3B Q4_K - Medium |  17.28 GiB |    30.53 B | CPU        |       4 |           tg128 |          0.94 ± 0.00 |

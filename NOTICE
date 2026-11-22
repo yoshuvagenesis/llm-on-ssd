@@ -1,0 +1,9 @@
+llm-on-ssd
+Copyright 2026 The llm-on-ssd authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains no model weights. Models used with this software are
+distributed by their own authors under their own licenses; see THIRD_PARTY.md.
+Files converted from a model (".moe" packs) are derived from that model and remain
+subject to the model's license.

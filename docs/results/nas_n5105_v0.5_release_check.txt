@@ -1,0 +1,45 @@
+== engine self-test (tiny model, checks correctness on this CPU)
+ENGINE TEST PASSED
+
+== 4-bit attention pack, 1 drive (v0.4 at 6 GB: generation 2.25-2.37 tok/s)
+RAM (cap 7.0 GB): attention/output 0.73 + expert cache 5.56 (with huge pages) + KV for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.65 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 124.43s (4.11 tok/s) | decode: 128 tokens in 46.21s (2.75 tok/s)
+decode per token: SSD read 180 MB (0.50 GB/s over the decode time)
+decode time per token: attention 113 ms, experts 197 ms (of which waiting for SSD ~96 ms), routers 23.3 ms, output head 20 ms
+expert blocks used: 53279 | from cache 79.0% | guessed, arrived in time 14.6% | still being read when needed 6.4% | not predicted at all 3.2%
+heat: peak CPU 90C, peak SSD 39C, paused 1.0s
+SSD: 13291 reads, 35.28 GB, 0.33 GB/s per read thread while reading | guesses 11574: used 82%, withdrawn 0%, dropped late 0% | evictions 11196 (forced 0) | cache in use 5.56 GB
+
+== 4-bit attention pack, 1 drive, with --refine (second prediction)
+RAM (cap 7.0 GB): attention/output 0.73 + expert cache 5.56 (with huge pages) + KV for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.65 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 132.65s (3.86 tok/s) | decode: 128 tokens in 61.07s (2.08 tok/s)
+decode per token: SSD read 195 MB (0.41 GB/s over the decode time)
+decode time per token: attention 92 ms, experts 194 ms (of which waiting for SSD ~111 ms), routers 22.9 ms, output head 16 ms
+expert blocks used: 53279 | from cache 79.0% | guessed, arrived in time 13.4% | still being read when needed 7.6% | not predicted at all 2.1%
+heat: peak CPU 93C, peak SSD 38C, paused 20.2s
+SSD: 14010 reads, 37.19 GB, 0.32 GB/s per read thread while reading | guesses 13025: used 77%, withdrawn 1%, dropped late 0% | evictions 11915 (forced 0) | cache in use 5.56 GB
+
+== 8-bit attention pack (best quality), 1 drive
+RAM (cap 7.0 GB): attention/output 1.42 + expert cache 4.87 (with huge pages) + KV for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.95 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 153.83s (3.33 tok/s) | decode: 128 tokens in 59.43s (2.14 tok/s)
+decode per token: SSD read 283 MB (0.61 GB/s over the decode time)
+decode time per token: attention 150 ms, experts 260 ms (of which waiting for SSD ~165 ms), routers 21.8 ms, output head 33 ms
+expert blocks used: 53289 | from cache 73.5% | guessed, arrived in time 16.0% | still being read when needed 10.5% | not predicted at all 4.3%
+heat: peak CPU 86C, peak SSD 40C, paused 0.0s
+SSD: 16876 reads, 49.77 GB, 0.31 GB/s per read thread while reading | guesses 14569: used 81%, withdrawn 0%, dropped late 0% | evictions 15223 (forced 0) | cache in use 4.87 GB
+
+== 8-bit attention pack (best quality), 2 drives
+RAM (cap 7.0 GB): attention/output 1.42 + expert cache 4.87 (with huge pages) + KV for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.95 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 152.80s (3.35 tok/s) | decode: 128 tokens in 53.47s (2.38 tok/s)
+decode per token: SSD read 283 MB (0.67 GB/s over the decode time)
+decode time per token: attention 164 ms, experts 193 ms (of which waiting for SSD ~87 ms), routers 24.1 ms, output head 37 ms
+expert blocks used: 53289 | from cache 73.5% | guessed, arrived in time 20.3% | still being read when needed 6.3% | not predicted at all 4.3%
+heat: peak CPU 85C, peak SSD 39C, paused 0.0s
+SSD: 16877 reads, 49.77 GB, 0.48 GB/s per read thread while reading | guesses 14573: used 81%, withdrawn 0%, dropped late 0% | evictions 15224 (forced 0) | cache in use 4.87 GB
+
+Check: the 'heat' lines should now show the CPU near 50-80 C under load (v0.4 showed 27.8 C from the wrong sensor).
+All results: /volume1/moe/release_v05_results.txt
