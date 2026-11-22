@@ -1,0 +1,19 @@
+# build output
+target/
+__pycache__/
+*.pyc
+
+# model files and packs (never commit weights)
+*.moe
+*.safetensors
+*.gguf
+*.bin
+*.npz
+*.npy
+
+# local results and prompts
+results_*/
+prompt*.txt
+*_results.txt
+!docs/results/*.txt
+.DS_Store
