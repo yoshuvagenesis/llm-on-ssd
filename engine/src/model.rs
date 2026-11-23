@@ -318,6 +318,20 @@ impl Model {
         (idx, w)
     }
 
+    /// Forget the conversation after the first `n` tokens (n = 0 starts fresh). The
+    /// KV cache keeps the first n positions, so a new message that repeats them
+    /// continues from there instead of reading everything again.
+    pub fn truncate(&mut self, n: usize) {
+        let n = n.min(self.pos);
+        let row = self.cfg.kv_heads * self.cfg.head_dim;
+        for l in 0..self.cfg.layers {
+            self.kcache[l].truncate(n * row);
+            self.vcache[l].truncate(n * row);
+            self.guesses[l].clear();
+        }
+        self.pos = n;
+    }
+
     /// Run one token (decode). Returns the logits for the next token.
     pub fn forward(&mut self, tok: u32) -> io::Result<Vec<f32>> {
         Ok(self.forward_batch(&[tok], false)?.pop().unwrap())

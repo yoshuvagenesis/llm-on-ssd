@@ -22,9 +22,11 @@ Under the same 7 GB limit, generation is **4.8× faster** than llama.cpp, and st
 **2.9× faster** than llama.cpp using all 12 GB of the machine. Full numbers, conditions and the raw log are in
 [docs/RESULTS.md](docs/RESULTS.md).
 
+It comes with a **chat page and an OpenAI-compatible API**: start it once on the
+machine with the SSD, then chat from any phone or computer on your home network.
+
 > **Status: research prototype.** It works and it is tested, but it supports one model
-> family (Qwen3-MoE), takes prompts as token ids, and has fast kernels only for x86-64.
-> See [Limitations](#limitations).
+> family (Qwen3-MoE) and has fast kernels only for x86-64. See [Limitations](#limitations).
 
 ## Why this works
 
@@ -64,30 +66,42 @@ numpy and about 80 GB of free disk once; any OS works for that step.
 git clone https://github.com/yoshuvagenesis/llm-on-ssd && cd llm-on-ssd
 
 # 1. Get the model (Apache-2.0, about 61 GB) and convert it to a pack (about 18 GB)
-pip install numpy tokenizers huggingface_hub
+pip install numpy huggingface_hub
 huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ~/models/Qwen3-30B-A3B
-python engine/tools/convert.py --model ~/models/Qwen3-30B-A3B --out /ssd/qwen3-30b-a3b.moe
+python engine/tools/convert.py --model ~/models/Qwen3-30B-A3B --out /ssd/qwen3-q4b-d4.moe --dense-fmt q4b
+cp ~/models/Qwen3-30B-A3B/tokenizer.json /ssd/
 
-# 2. Turn a message into token ids
-python engine/tools/encode.py --model ~/models/Qwen3-30B-A3B \
-    "What is the capital of France? Answer in one sentence." > /ssd/prompt.txt
-
-# 3. Build and run (container)
+# 2. Build and start the chat server (runs in the background, restarts after a reboot)
 docker build -t moe-bench -f docker/Dockerfile .
-docker run --rm --memory 7g --memory-swap 7g --entrypoint moe-engine -v /ssd:/models moe-bench \
-    --pack /models/qwen3-30b-a3b.moe --prompt-file /models/prompt.txt --max-new 64
+MODELS=/ssd sh docker/serve.sh
+```
+
+Then open `http://<the machine's IP address>:8080` in a browser on any device in your
+home network. Answers appear word by word. A panel shows the queue, speed, temperatures,
+memory and cache use. Use `--dense-fmt q8` and `PACK=qwen3-30b-a3b.moe` for the
+best-quality pack.
+
+**API.** The same port serves an OpenAI-compatible API, so existing chat apps can use it:
+base URL `http://<address>:8080/v1`, any API key (or the password, if set), model name as
+shown at `/v1/models`. `"think": true` (or `chat_template_kwargs.enable_thinking`) lets
+the model reason first; the reasoning arrives as `reasoning_content`.
+
+**One answer in the terminal:**
+```bash
+docker run --rm --memory 7g -v /ssd:/models --entrypoint moe-engine moe-bench \
+    --pack /models/qwen3-q4b-d4.moe --tokenizer /models/tokenizer.json --prompt "What is the capital of France?"
 ```
 
 Without Docker: `cd engine && cargo build --release`, then run `./target/release/moe-engine`
-with the same options. Step-by-step instructions, including the exact benchmark, are in
-[docs/REPRODUCE.md](docs/REPRODUCE.md).
+with the same options (`--serve` for the server). Step-by-step instructions, including the
+exact benchmark, are in [docs/REPRODUCE.md](docs/REPRODUCE.md).
 
 ## Repository layout
 
 | Folder | What it is |
 |---|---|
-| `engine/` | The inference engine (Rust, no third-party crates) and its Python tools: converter, prompt encoder, independent reference implementation, test suite |
-| `docker/` | Container build, benchmark runner, release check script |
+| `engine/` | The inference engine with its chat server and tokenizer (Rust, no third-party crates), and its Python tools: converter, independent reference implementation, test suites |
+| `docker/` | Container build, chat server start script, benchmark runner, release check script |
 | `docs/` | How it works, results, how to reproduce, pack format |
 | `kernel/` | Standalone CPU benchmark for the int8/int4 kernel formats we evaluated |
 | `ssd/` | SSD read benchmark (fio) |
@@ -97,12 +111,14 @@ with the same options. Step-by-step instructions, including the exact benchmark,
 
 - **One model family**: Qwen3-MoE (Qwen3-30B-A3B is the reference). Other MoE models
   need converter and engine work.
-- **Prompts are token ids.** `engine/tools/encode.py` (Python, Hugging Face
-  `tokenizers`) turns text into ids. The engine prints text on the way out.
+- **One answer at a time.** Requests wait in line; the page shows the place in line and
+  an estimated wait. When a different conversation takes its turn, the engine reads that
+  conversation again (about 2 minutes per 500 tokens on the N5105); continuing the same
+  conversation reuses what is already in memory.
 - **Fast kernels are x86-64 SSE only.** It runs correctly on ARM, including Apple
   Silicon, but slowly.
-- **Greedy decoding only** (no sampling yet). Context up to `--max-context` tokens
-  (default 4096).
+- **Context** up to `--max-context` tokens (default 4096, about 3,000 words). When a
+  conversation gets longer, its oldest messages are left out, and the page says so.
 - **Quality**: experts are stored at 4.5 bits per weight, which costs about 3% in
   perplexity (6.21 vs 6.01). See [docs/RESULTS.md](docs/RESULTS.md#quality).
 - **Heat**: generation keeps the CPU fully busy. On our NAS the CPU reached

@@ -1,10 +1,33 @@
-# moe-engine v0.5: storage-first MoE inference
+# moe-engine v0.6: storage-first MoE inference
 
 Runs Qwen3-MoE models (reference: Qwen3-30B-A3B) with the experts streamed from the
 SSD. RAM holds only the attention weights, routers and output head (~1.4 GB), the KV
 cache, and an LRU cache of experts. All of it stays under one hard cap, `--ram-gb`
 (default 7): the expert cache gets what is left after the rest is reserved, and the
 engine refuses to start if the plan does not fit.
+
+## New in v0.6: chat server
+
+- `--serve --tokenizer tokenizer.json`: one server with a **chat page** at `/` and an
+  **OpenAI-compatible API** at `/v1/chat/completions` (streaming and not), `/v1/models`,
+  plus `/api/stats`. Options: `--port` (8080), `--host` (0.0.0.0), `--password`,
+  `--max-answer` (1024 tokens). `docker/serve.sh` starts it in the background.
+- **Tokenizer inside the engine**, read from the model's own `tokenizer.json`: text in,
+  text out, no Python step. `--prompt "text"` gives one answer in the terminal.
+  `tools/test_tokenizer.py` checks it against Python's regex engine;
+  `tools/verify_tokenizer.py` checks it against Hugging Face on the real file.
+- **Conversations reuse the KV cache**: each request is compared with the tokens already
+  in memory, and only the new part is read. Answers are remembered token by token, so
+  continuing a chat does not re-read the previous answer.
+- **Queue**: one answer at a time; waiting requests get their place in line and an
+  estimated wait (as SSE comments `: queue <place> <seconds>`, which other clients ignore).
+- **Sampling** with Qwen3's recommended settings (temperature 0.7, top-p 0.8, top-k 20;
+  thinking 0.6 / 0.95 / 20), or greedy with `"temperature": 0`.
+- **Thinking switch**: `"think": true` or `chat_template_kwargs.enable_thinking`; the
+  reasoning arrives as `reasoning_content`, the page shows it folded.
+- **Long chats**: when a conversation would pass `--max-context`, its oldest messages are
+  left out (system messages are kept) and the client is told.
+- `tools/test_server.py` tests all of this end to end on a tiny model.
 
 ## New in v0.5
 
@@ -126,10 +149,9 @@ attention and the output head half the size and faster, measured ~+2.7% perplexi
 
 ## Not done yet (planned, in rough order)
 
-1. Tokenizer inside the engine (prompts currently come from `tools/encode.py`)
-2. Sampling (temperature, top-p); currently greedy only
+1. Save a conversation's KV cache to the SSD, so switching between people is quick
+2. NFC text normalization in the tokenizer (only matters for decomposed Unicode input)
 3. Cache policy tuned on real routing traces (segmented LRU, per-layer budgets)
 4. Faster multi-threaded kernels (4 threads reach ~78% of the standalone benchmark)
 5. NEON kernels for ARM / Apple Silicon; io_uring reads
 6. More model families (other MoE architectures)
-7. Saving a conversation's KV cache to the SSD between sessions

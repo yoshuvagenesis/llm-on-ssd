@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-on-ssd</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
+    --accent: #2f6f5e; --accent-soft: #e4efeb; --me: #2f6f5e; --me-text: #ffffff; --warn: #a35a00;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161715; --panel: #1f201e; --text: #e9e8e4; --muted: #9b9a95; --line: #33342f;
+      --accent: #7cc4ad; --accent-soft: #243631; --me: #2f6f5e; --me-text: #ffffff; --warn: #f0a64a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .app { display: grid; grid-template-columns: 1fr 300px; height: 100%; }
+  @media (max-width: 860px) { .app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; } }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  header .model { color: var(--muted); font-size: 13px; font-family: var(--mono); }
+  header .spacer { flex: 1; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  @media (prefers-color-scheme: dark) { button.primary { color: #10201b; } }
+  button:disabled { opacity: .5; cursor: default; }
+  .main { display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 20px; }
+  .inner { max-width: 760px; margin: 0 auto; }
+  .msg { margin: 0 0 16px; display: flex; }
+  .msg .bubble { padding: 10px 14px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; max-width: 100%; }
+  .msg.user { justify-content: flex-end; }
+  .msg.user .bubble { background: var(--me); color: var(--me-text); max-width: 80%; }
+  .msg.assistant .bubble { background: var(--panel); border: 1px solid var(--line); width: 100%; }
+  .bubble pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+                overflow-x: auto; font: 13px/1.45 var(--mono); white-space: pre; margin: 8px 0; }
+  .bubble code { font-family: var(--mono); font-size: 13px; background: var(--bg); padding: 1px 4px; border-radius: 4px; }
+  details.think { margin-bottom: 8px; color: var(--muted); font-size: 14px; }
+  details.think summary { cursor: pointer; }
+  details.think div { white-space: pre-wrap; border-left: 2px solid var(--line); padding-left: 10px; margin-top: 6px; }
+  .note { color: var(--muted); font-size: 13px; text-align: center; margin: 8px 0 16px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+  .empty b { color: var(--text); display: block; font-size: 18px; margin-bottom: 6px; }
+  .composer { border-top: 1px solid var(--line); padding: 12px 20px 16px; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea { flex: 1; resize: none; font: inherit; color: var(--text); background: var(--panel);
+             border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 46px; max-height: 200px; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .opts { display: flex; gap: 16px; align-items: center; margin-top: 8px; color: var(--muted); font-size: 13px; }
+  #status { flex: 1; text-align: right; }
+  #status.warn { color: var(--warn); }
+  aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 16px 18px; font-size: 13px; }
+  @media (max-width: 860px) { aside { border-left: 0; border-top: 1px solid var(--line); max-height: 34vh; } }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; font-weight: 600; }
+  aside h2:first-child { margin-top: 0; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0; }
+  .kv span:last-child { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .bar { height: 8px; border-radius: 4px; background: var(--bg); overflow: hidden; display: flex; margin: 6px 0 4px; }
+  .bar i { display: block; height: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); }
+  .legend b { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .login { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; }
+  .login form { background: var(--panel); padding: 20px; border-radius: 12px; width: min(360px, 90vw); }
+  .login input { width: 100%; font: inherit; padding: 8px 10px; margin: 10px 0; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="main">
+    <header>
+      <h1>llm-on-ssd</h1><span class="model" id="model"></span>
+      <span class="spacer"></span>
+      <button id="newchat" title="Start a new conversation">New chat</button>
+    </header>
+    <div id="log"><div class="inner" id="msgs"></div></div>
+    <div class="composer"><div class="inner">
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="Ask anything…  (Enter to send, Shift+Enter for a new line)"></textarea>
+        <button class="primary" id="send">Send</button>
+        <button id="stop" style="display:none">Stop</button>
+      </div>
+      <div class="opts">
+        <label><input type="checkbox" id="think"> Think first (better on hard questions, much slower)</label>
+        <span id="status"></span>
+      </div>
+    </div></div>
+  </div>
+  <aside id="stats">
+    <h2>Now</h2>
+    <div class="kv"><span>State</span><span id="s-phase">–</span></div>
+    <div class="kv"><span>Waiting in line</span><span id="s-waiting">–</span></div>
+    <div class="kv"><span>Generating</span><span id="s-gen">–</span></div>
+    <div class="kv"><span>Reading message</span><span id="s-read">–</span></div>
+    <h2>Last answer</h2>
+    <div class="kv"><span>Writing speed</span><span id="s-lgen">–</span></div>
+    <div class="kv"><span>Reading speed</span><span id="s-lread">–</span></div>
+    <div class="kv"><span>Experts from RAM</span><span id="s-hit">–</span></div>
+    <div class="kv"><span>SSD read per token</span><span id="s-mb">–</span></div>
+    <h2>Heat</h2>
+    <div class="kv"><span>CPU</span><span id="s-cpu">–</span></div>
+    <div class="kv"><span>SSD</span><span id="s-ssd">–</span></div>
+    <h2>Memory <span id="s-cap"></span></h2>
+    <div class="bar" id="s-bar"></div>
+    <div class="legend" id="s-legend"></div>
+    <h2>Since start</h2>
+    <div class="kv"><span>Answers</span><span id="s-jobs">–</span></div>
+    <div class="kv"><span>Experts from RAM</span><span id="s-hitall">–</span></div>
+    <div class="kv"><span>Read from SSD</span><span id="s-ssdall">–</span></div>
+  </aside>
+</div>
+<div class="login" id="login"><form id="loginform">
+  <b>Password</b><div class="note" style="text-align:left;margin:4px 0 0">This server asks for a password.</div>
+  <input type="password" id="pw" autocomplete="current-password"><button class="primary" type="submit">Continue</button>
+</form></div>
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+let chat = store.get("llm-on-ssd-chat", []);   // [{role, content, reasoning?}]
+let password = store.get("llm-on-ssd-pw", "");
+let busy = false, ctrl = null;
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if (password) h["Authorization"] = "Bearer " + password;
+  return h;
+}
+function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function formatText(s) {
+  // code fences and inline code; everything else stays as typed
+  const parts = s.split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2 === 1) { const nl = p.indexOf("\n"); return "<pre>" + escapeHtml(nl >= 0 ? p.slice(nl + 1) : p) + "</pre>"; }
+    return escapeHtml(p).replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  }).join("");
+}
+function render() {
+  const box = $("msgs");
+  if (!chat.length) {
+    box.innerHTML = '<div class="empty"><b>Ask the model anything.</b>It runs on this machine, from its SSD. Answers appear word by word.</div>';
+    return;
+  }
+  box.innerHTML = "";
+  for (const m of chat) {
+    if (m.role === "note") { const n = document.createElement("div"); n.className = "note"; n.textContent = m.content; box.appendChild(n); continue; }
+    const row = document.createElement("div"); row.className = "msg " + m.role;
+    const b = document.createElement("div"); b.className = "bubble";
+    if (m.reasoning) {
+      const d = document.createElement("details"); d.className = "think";
+      d.innerHTML = "<summary>Thinking</summary><div></div>"; d.querySelector("div").textContent = m.reasoning;
+      b.appendChild(d);
+    }
+    const c = document.createElement("div");
+    c.innerHTML = m.content ? formatText(m.content) : (m.role === "assistant" ? '<span style="color:var(--muted)">…</span>' : "");
+    b.appendChild(c); row.appendChild(b); box.appendChild(row);
+  }
+  const log = $("log"); log.scrollTop = log.scrollHeight;
+}
+function setStatus(t, warn) { $("status").textContent = t || ""; $("status").className = warn ? "warn" : ""; }
+function setBusy(b) { busy = b; $("send").style.display = b ? "none" : ""; $("stop").style.display = b ? "" : "none"; }
+function fmtSecs(s) { s = Math.round(s); return s < 60 ? s + " s" : Math.round(s / 60) + " min"; }
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || busy) return;
+  $("input").value = ""; autosize();
+  chat.push({ role: "user", content: text });
+  const answer = { role: "assistant", content: "", reasoning: "" };
+  chat.push(answer); render(); setBusy(true); setStatus("Sending…");
+  const messages = chat.filter(m => (m.role === "user" || m.role === "assistant") && m !== answer)
+                       .map(m => ({ role: m.role, content: m.content }));
+  ctrl = new AbortController();
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST", headers: headers(), signal: ctrl.signal,
+      body: JSON.stringify({ messages, stream: true, think: $("think").checked }),
+    });
+    if (r.status === 401) { chat.pop(); chat.pop(); render(); askPassword(); return; }
+    if (!r.ok) throw new Error("server answered " + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, k); buf = buf.slice(k + 2);
+        for (const line of ev.split("\n")) handleLine(line, answer);
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") { answer.content += (answer.content ? "\n\n" : "") + "[error: " + e.message + "]"; }
+  } finally {
+    if (!answer.content && !answer.reasoning) answer.content = "[stopped]";
+    setBusy(false); setStatus(""); ctrl = null; store.set("llm-on-ssd-chat", chat); render();
+  }
+}
+function handleLine(line, answer) {
+  if (line.startsWith(": queue ")) {
+    const [pos, eta] = line.slice(8).split(" ").map(Number);
+    setStatus((pos === 1 ? "Next in line" : "Waiting in line: " + pos + " ahead of you") + ", about " + fmtSecs(eta));
+  } else if (line.startsWith(": reading ")) {
+    const [d, t, reused] = line.slice(10).split(" ").map(Number);
+    setStatus(t <= 1 ? "Starting…" : "Reading the conversation… " + d + " / " + t + (reused ? " (" + reused + " remembered)" : ""));
+  } else if (line.startsWith(": dropped ")) {
+    chat.splice(chat.length - 1, 0, { role: "note", content: "The conversation got long, so the oldest messages were left out." });
+  } else if (line.startsWith("data: ")) {
+    const d = line.slice(6);
+    if (d === "[DONE]") return;
+    let j; try { j = JSON.parse(d); } catch (e) { return; }
+    if (j.error) { answer.content += "[error: " + j.error.message + "]"; render(); return; }
+    const delta = j.choices && j.choices[0] && j.choices[0].delta;
+    if (!delta) return;
+    if (delta.reasoning_content) { answer.reasoning += delta.reasoning_content; setStatus("Thinking…"); }
+    if (delta.content) { answer.content += delta.content; setStatus("Writing…"); }
+    render();
+  }
+}
+function askPassword() { $("login").style.display = "flex"; $("pw").focus(); }
+$("loginform").onsubmit = e => { e.preventDefault(); password = $("pw").value; store.set("llm-on-ssd-pw", password); $("login").style.display = "none"; loadModel(); };
+$("send").onclick = send;
+$("stop").onclick = () => { if (ctrl) ctrl.abort(); };
+$("newchat").onclick = () => { if (busy && ctrl) ctrl.abort(); chat = []; store.set("llm-on-ssd-chat", chat); render(); $("input").focus(); };
+$("input").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; }
+$("input").addEventListener("input", autosize);
+
+async function loadModel() {
+  try {
+    const r = await fetch("/v1/models", { headers: headers() });
+    if (r.status === 401) return askPassword();
+    const j = await r.json(); $("model").textContent = j.data[0].id;
+  } catch (e) {}
+}
+const COLORS = ["#2f6f5e", "#7aa898", "#c9a227", "#9aa0a6"];
+async function poll() {
+  try {
+    const r = await fetch("/api/stats", { headers: headers() });
+    if (r.ok) {
+      const s = await r.json(), j = s.job;
+      const names = { idle: "idle", reading: "reading a message", generating: "writing an answer", cooling: "cooling down" };
+      $("s-phase").innerHTML = '<span class="pill">' + (names[s.phase] || s.phase) + "</span>";
+      $("s-waiting").textContent = s.waiting;
+      $("s-gen").textContent = s.phase === "generating" || s.phase === "cooling" ? j.generated + " · " + j.tok_s.toFixed(2) + " tok/s" : "–";
+      $("s-read").textContent = s.phase === "reading" ? j.prompt_done + " / " + j.prompt_total + (j.read_tok_s ? " · " + j.read_tok_s.toFixed(1) + " tok/s" : "") : "–";
+      const L = s.last;
+      $("s-lgen").textContent = L.gen_tok_s ? L.gen_tok_s.toFixed(2) + " tok/s" : "–";
+      $("s-lread").textContent = L.read_tok_s ? L.read_tok_s.toFixed(1) + " tok/s" : "–";
+      $("s-hit").textContent = L.gen_tok_s ? L.cache_hit_pct.toFixed(0) + "%" : "–";
+      $("s-mb").textContent = L.gen_tok_s ? L.ssd_mb_per_token + " MB" : "–";
+      $("s-cpu").textContent = s.heat.cpu_c ? s.heat.cpu_c.toFixed(0) + " °C" + (s.heat.pausing ? " (pausing)" : "") : "–";
+      $("s-ssd").textContent = s.heat.ssd_c ? s.heat.ssd_c.toFixed(0) + " °C" : "–";
+      const ram = s.ram, cap = ram.cap_gb;
+      $("s-cap").textContent = "(cap " + cap.toFixed(1) + " GB)";
+      const parts = [["attention", ram.attention_gb], ["expert cache", ram.cache_gb], ["conversation", ram.kv_gb], ["other", ram.other_gb]];
+      $("s-bar").innerHTML = parts.map((p, i) => '<i style="width:' + (p[1] / cap * 100) + "%;background:" + COLORS[i] + '"></i>').join("");
+      $("s-legend").innerHTML = parts.map((p, i) => '<span><b style="background:' + COLORS[i] + '"></b>' + p[0] + " " + p[1].toFixed(2) + "</span>").join("");
+      $("s-jobs").textContent = s.jobs_done;
+      $("s-hitall").textContent = s.cache.hit_pct_total.toFixed(0) + "%";
+      $("s-ssdall").textContent = s.cache.ssd_read_gb_total.toFixed(1) + " GB";
+      if (busy && s.phase === "cooling") setStatus("Pausing to cool down (CPU " + s.heat.cpu_c.toFixed(0) + " °C)…", true);
+    }
+  } catch (e) {}
+  setTimeout(poll, 1000);
+}
+render(); loadModel(); poll(); $("input").focus();
+</script>
+</body>
+</html>

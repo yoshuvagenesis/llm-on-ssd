@@ -3,7 +3,17 @@
 //! Without readable sensors (e.g. macOS) the guard does nothing.
 
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Latest readings, shared with the server's statistics (temperatures in 0.1 C).
+#[derive(Default)]
+pub struct Live {
+    pub cpu_dc: AtomicU32,
+    pub ssd_dc: AtomicU32,
+    pub pausing: AtomicBool,
+}
 
 pub struct Guard {
     cpu: Vec<String>,
@@ -14,6 +24,7 @@ pub struct Guard {
     pub peak_ssd: f32,
     pub paused: f64,
     last: Instant,
+    pub live: Arc<Live>,
 }
 
 fn read_c(path: &str) -> Option<f32> {
@@ -56,11 +67,20 @@ impl Guard {
         } else {
             board
         };
-        Guard { cpu, ssd, max_cpu, max_ssd, peak_cpu: 0.0, peak_ssd: 0.0, paused: 0.0, last: Instant::now() }
+        Guard { cpu, ssd, max_cpu, max_ssd, peak_cpu: 0.0, peak_ssd: 0.0, paused: 0.0, last: Instant::now(), live: Arc::new(Live::default()) }
     }
 
     pub fn sensors(&self) -> String {
         format!("{} CPU, {} SSD sensors", self.cpu.len(), self.ssd.len())
+    }
+
+    /// A function that reads the current (CPU, SSD) temperatures, for other threads.
+    pub fn reader(&self) -> impl Fn() -> (f32, f32) + Send + 'static {
+        let (cpu, ssd) = (self.cpu.clone(), self.ssd.clone());
+        move || {
+            let mx = |v: &[String]| v.iter().filter_map(|p| read_c(p)).fold(0f32, f32::max);
+            (mx(&cpu), mx(&ssd))
+        }
     }
 
     fn temps(&self) -> (f32, f32) {
@@ -75,6 +95,8 @@ impl Guard {
         }
         self.last = Instant::now();
         let (mut c, mut s) = self.temps();
+        self.live.cpu_dc.store((c * 10.0) as u32, Ordering::Relaxed);
+        self.live.ssd_dc.store((s * 10.0) as u32, Ordering::Relaxed);
         self.peak_cpu = self.peak_cpu.max(c);
         self.peak_ssd = self.peak_ssd.max(s);
         let hot = |c: f32, s: f32, margin: f32| {
@@ -84,10 +106,14 @@ impl Guard {
             return;
         }
         let t0 = Instant::now();
+        self.live.pausing.store(true, Ordering::Relaxed);
         while hot(c, s, 5.0) && t0.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_millis(250));
             (c, s) = self.temps();
+            self.live.cpu_dc.store((c * 10.0) as u32, Ordering::Relaxed);
+            self.live.ssd_dc.store((s * 10.0) as u32, Ordering::Relaxed);
         }
+        self.live.pausing.store(false, Ordering::Relaxed);
         self.paused += t0.elapsed().as_secs_f64();
     }
 }

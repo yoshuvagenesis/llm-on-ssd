@@ -133,3 +133,22 @@ CPU's own sensor and the NVMe sensors every half second. Between tokens, it paus
 the CPU is above `--max-cpu-temp` (default 90 °C) or an SSD is above `--max-ssd-temp`
 (70 °C), until they are 5 °C lower again. Under full load the N5105 reached 85–93 °C,
 within its specification. The SSDs stayed below 41 °C because they are only read.
+
+## 11. The chat server
+
+`--serve` keeps the model loaded and serves a chat page and an OpenAI-compatible API.
+
+- **Tokenizer.** It is written into the engine and reads Qwen's own `tokenizer.json`. It
+  splits text with Qwen's pattern (a hand-written matcher with Unicode letter tables),
+  maps bytes to the byte-level alphabet and applies the BPE merges. It is checked
+  against a regex engine on texts in many scripts, and against Hugging Face's tokenizer
+  on the real file.
+- **Conversations.** Each request is turned into tokens with Qwen3's chat format and
+  compared with the tokens already in the KV cache. Only the part after the common start
+  is read. Continuing a chat therefore costs only the new message; a different
+  conversation is read from the start.
+- **One answer at a time.** All RAM beyond the fixed parts is expert cache, and one KV
+  cache is reserved, so requests are queued instead of run side by side. Running two
+  conversations at once would also split the SSD bandwidth that each token needs.
+- **Statistics.** `/api/stats` reports the queue, progress, speed, temperatures, the RAM
+  plan and cache use. The page polls it every second.

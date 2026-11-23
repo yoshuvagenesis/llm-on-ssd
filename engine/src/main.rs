@@ -1,9 +1,21 @@
 //! moe-engine: run a mixture-of-experts LLM with experts streamed from the SSD.
 //!
-//!   moe-engine --pack model.moe --prompt-ids 151644,872,... [options]
+//!   moe-engine --pack model.moe --tokenizer tokenizer.json --serve        chat server (web page + API)
+//!   moe-engine --pack model.moe --tokenizer tokenizer.json --prompt "Hi"  one answer in the terminal
+//!   moe-engine --pack model.moe --prompt-ids 151644,872,... [options]      token ids in, for tests
+//!
+//! Chat server
+//!   --serve                start the chat server: web page at /, OpenAI-compatible API at /v1
+//!   --port N               port (default 8080)        --host A   address to listen on (default 0.0.0.0)
+//!   --password P           require this password (sent by the page / API clients as a Bearer token)
+//!   --max-answer N         default answer length limit in tokens (default 1024)
+//!   --tokenizer f          the model's tokenizer.json (needed for text in: --serve, --prompt)
 //!
 //! Options
+//!   --prompt "text"        one user message (Qwen3 chat format); --think lets the model reason first
 //!   --prompt-ids a,b,c | --prompt-file f   prompt token ids (comma/space separated)
+//!   --tokenize f           print the token ids of text file f and exit (needs --tokenizer;
+//!                          --no-special treats "<|im_start|>" etc. as plain text)
 //!   --max-new N            tokens to generate (default 64)
 //!   --ram-gb G             hard cap for all engine RAM (default 7): attention weights, KV cache,
 //!                          buffers; the expert cache gets the rest
@@ -25,12 +37,16 @@
 //!   --out-ids f            write prompt + generated ids to f
 //!   --quiet                only print the generated text
 
+mod json;
 mod kernels;
 mod model;
 mod pack;
 mod pool;
+mod server;
 mod store;
 mod thermal;
+mod tokenizer;
+mod unicode_letters;
 
 use std::io::Write;
 use std::time::Instant;
@@ -114,17 +130,63 @@ fn main() {
     }
     let flag = |n: &str| args.iter().any(|a| a == n);
     let get = |n: &str, d: &str| arg(&args, n).unwrap_or_else(|| d.to_string());
+    let serve = flag("--serve");
+    let tok = arg(&args, "--tokenizer").map(|p| {
+        let t = tokenizer::Tokenizer::load(&p).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1)
+        });
+        if let Some(w) = &t.warning {
+            eprintln!("warning: {w}");
+        }
+        t
+    });
+    if let Some(f) = arg(&args, "--tokenize") {
+        let Some(t) = &tok else {
+            eprintln!("--tokenize needs --tokenizer tokenizer.json");
+            std::process::exit(1)
+        };
+        let text = std::fs::read_to_string(&f).expect("cannot read text file");
+        if flag("--pieces") {
+            // debugging: the pre-tokenizer's pieces, one JSON string per line
+            for p in tokenizer::pretokenize(&text) {
+                println!("{}", json::esc(p));
+            }
+            return;
+        }
+        let ids = t.encode(&text, !flag("--no-special"));
+        println!("{}", ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
+        return;
+    }
     let Some(pack_path) = arg(&args, "--pack") else {
-        eprintln!("usage: moe-engine --pack model.moe --prompt-ids 1,2,3 [--max-new 64] [--cache-gb 4] ...");
+        eprintln!("usage: moe-engine --pack model.moe --tokenizer tokenizer.json --serve");
+        eprintln!("       moe-engine --pack model.moe --tokenizer tokenizer.json --prompt \"text\" [--max-new 64]");
+        eprintln!("       moe-engine --pack model.moe --prompt-ids 1,2,3 [--max-new 64]");
         std::process::exit(1);
     };
-    let prompt: Vec<u32> = if let Some(f) = arg(&args, "--prompt-file") {
+    let prompt: Vec<u32> = if let Some(text) = arg(&args, "--prompt") {
+        let Some(t) = &tok else {
+            eprintln!("--prompt needs --tokenizer tokenizer.json (or use --prompt-ids)");
+            std::process::exit(1)
+        };
+        let mut ids = t.encode("<|im_start|>user\n", true);
+        ids.extend(t.encode(&text, false));
+        ids.extend(t.encode("<|im_end|>\n<|im_start|>assistant\n", true));
+        if !flag("--think") {
+            ids.extend(t.encode("<think>\n\n</think>\n\n", true));
+        }
+        ids
+    } else if let Some(f) = arg(&args, "--prompt-file") {
         parse_ids(&std::fs::read_to_string(f).expect("cannot read prompt file"))
     } else {
         parse_ids(&get("--prompt-ids", ""))
     };
-    if prompt.is_empty() {
-        eprintln!("no prompt ids given (--prompt-ids or --prompt-file)");
+    if prompt.is_empty() && !serve {
+        eprintln!("no prompt given (--serve, --prompt, --prompt-ids or --prompt-file)");
+        std::process::exit(1);
+    }
+    if serve && tok.is_none() {
+        eprintln!("--serve needs --tokenizer tokenizer.json (the model's own file)");
         std::process::exit(1);
     }
     let max_new: usize = get("--max-new", "64").parse().unwrap();
@@ -158,13 +220,16 @@ fn main() {
     let cfgu = |k: &str| pk.cfg_usize(k).unwrap_or(0);
     let dense: usize = pk.tensors.iter().filter(|(n, _)| n.as_str() != "embed").map(|(_, t)| t.nbytes).sum();
     let kv = max_ctx * cfgu("num_hidden_layers") * 2 * cfgu("num_key_value_heads") * cfgu("head_dim") * 2;
-    let other = 300_000_000usize; // buffers, vocabulary, thread stacks, the program itself
+    // buffers, vocabulary, thread stacks, the program itself; the tokenizer's tables
+    let other = 300_000_000usize + if tok.is_some() { 100_000_000 } else { 0 };
     let budget = (ram_gb * 1e9) as i64 - (dense + kv + other) as i64;
     let cache_bytes = match cache_req {
         Some(g) => (g * 1e9) as usize,
         None => budget.max(0) as usize,
     };
-    let max_new = if prompt.len() + max_new > max_ctx {
+    let max_new = if serve {
+        max_new
+    } else if prompt.len() + max_new > max_ctx {
         if prompt.len() >= max_ctx {
             eprintln!("error: the prompt has {} tokens, more than --max-context {}", prompt.len(), max_ctx);
             std::process::exit(1);
@@ -225,6 +290,33 @@ fn main() {
             "heat guard: pause above CPU {}C / SSD {}C ({})",
             guard.max_cpu, guard.max_ssd, guard.sensors()
         );
+    }
+
+    if serve {
+        let ram_json = format!(
+            "{{\"cap_gb\":{:.2},\"attention_gb\":{:.2},\"cache_gb\":{:.2},\"kv_gb\":{:.2},\"other_gb\":{:.2}}}",
+            ram_gb,
+            m.dense_bytes as f64 / 1e9,
+            store.cache_bytes() as f64 / 1e9,
+            kv as f64 / 1e9,
+            other as f64 / 1e9
+        );
+        let model_name = std::path::Path::new(&pack_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "llm-on-ssd".into());
+        let opts = server::Opts {
+            host: get("--host", "0.0.0.0"),
+            port: get("--port", "8080").parse().expect("bad --port"),
+            password: arg(&args, "--password"),
+            max_ctx,
+            prefill_batch,
+            model_name,
+            default_max_tokens: get("--max-answer", "1024").parse().expect("bad --max-answer"),
+            ram_json,
+        };
+        server::run(server::Engine { m, guard, vocab, tok: tok.unwrap() }, opts);
+        return;
     }
 
     let mut dump = arg(&args, "--dump-logits").map(|f| std::fs::File::create(f).expect("cannot create logits file"));
