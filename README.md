@@ -19,8 +19,9 @@ Reference setup: **Qwen3-30B-A3B** (30.5B parameters, 3.3B active per token) on 
 | llama.cpp, Q4_K_M | all 12 GB | 2.62 tok/s | 0.94 tok/s |
 
 Under the same 7 GB limit, generation is **4.8× faster** than llama.cpp, and still
-**2.9× faster** than llama.cpp using all 12 GB of the machine. Full numbers, conditions and the raw log are in
-[docs/RESULTS.md](docs/RESULTS.md).
+**2.9× faster** than llama.cpp using all 12 GB of the machine. In real chats on the chat
+server, answers were written at **2.1–3.5 tok/s**, with about 90% of the experts served
+from RAM. Full numbers, conditions and the raw log are in [docs/RESULTS.md](docs/RESULTS.md).
 
 It comes with a **chat page and an OpenAI-compatible API**: start it once on the
 machine with the SSD, then chat from any phone or computer on your home network.

@@ -60,6 +60,30 @@ predicted at all.
 Heat: CPU peaks of 85–93 °C, SSDs at most 40 °C. The heat guard paused for 1 s in the
 fastest run and 20 s in the `--refine` run.
 
+## Real chat use (v0.6 chat server)
+
+The numbers above are from a controlled benchmark that starts with an empty cache. These
+come from the chat server (`--serve`, 4-bit attention pack, 1 SSD, 7 GB cap) during the
+first real conversations on the N5105, read from `/api/stats`. They are a few answers, not
+a controlled benchmark: speed depends on the topic, the answer length and how long the
+conversation already is.
+
+| Answer | Conversation before it | New tokens read | Answer length | Writing | Experts from RAM | SSD read per token |
+|---|---|---|---|---|---|---|
+| Short chat | short | – | – | **3.49 tok/s** | 91.1% | 122 MB |
+| Follow-up, long answer (measured while writing) | 190 tokens, reused | 44 | 668 tokens so far | 2.52 tok/s | – | – |
+| Follow-up in a long chat | 1,257 tokens, reused | 20 | 512 tokens | 2.10 tok/s | 86.3% | 181 MB |
+
+Over the first four answers, **90.5%** of the experts needed came from the RAM cache.
+New messages were read at 3.3–5.2 tok/s. Continuing a conversation read only the new
+message: 1,257 earlier tokens were reused instead of read again. The CPU was at 65–79 °C
+when checked, with no heat pause in progress; the SSDs stayed at about 35 °C.
+
+Why the range: in a real chat the same experts keep coming back, so the cache serves more
+of them than in the cold-start benchmark, which makes short answers faster (3.49 vs 2.75
+tok/s). Long answers in long conversations are slower, because every new token attends
+to everything before it, so attention takes longer as the conversation grows.
+
 ## Baseline: llama.cpp on the same machine
 
 | Run | Memory | Prompt reading | Generation |
@@ -98,6 +122,10 @@ the likely reason its generation speed stays far below what the SSD could delive
   **bit-identical** output, for three pack formats. It passes on the N5105.
 - **Real text.** The converted Qwen3-30B-A3B answers normally, e.g. "The capital of
   France is Paris." to the prompt in the quick start.
+- **Tokenizer.** The engine's built-in tokenizer gives exactly the same tokens as Hugging
+  Face's on Qwen3-30B-A3B's own `tokenizer.json`: 24 of 24 test texts, 11,651 tokens, in
+  English, code, chat markup, 10 Indian scripts, Chinese, Japanese, Korean, Arabic, Hebrew,
+  Thai, Greek, Cyrillic, emoji and unusual spacing (`engine/tools/verify_tokenizer.py`).
 - **Cost of compression**, measured as perplexity on `trace/corpus.txt` (lower is
   better; full precision is 6.011):
 
