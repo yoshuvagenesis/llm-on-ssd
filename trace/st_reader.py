@@ -76,11 +76,18 @@ class SafeTensors:
         return self.to_f32(arr[idx], dt)
 
 
-def write_safetensors(path, tensors):
-    """Write {name: float32 array} as BF16 safetensors (used only by the self-test)."""
+def write_safetensors(path, tensors, f32=()):
+    """Write {name: float32 array} as BF16 safetensors, or F32 for names in `f32`
+    (used only by the self-tests)."""
     header, chunks, off = {}, [], 0
     for name, a in tensors.items():
         a = np.ascontiguousarray(a, dtype=np.float32)
+        if name in f32:
+            b = a.tobytes()
+            header[name] = {"dtype": "F32", "shape": list(a.shape), "data_offsets": [off, off + len(b)]}
+            chunks.append(b)
+            off += len(b)
+            continue
         bits = a.view(np.uint32)
         # round-to-nearest-even to bf16
         bf = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)

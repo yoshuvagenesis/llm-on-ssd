@@ -37,6 +37,17 @@ vocab <offset> <nbytes>                            the vocabulary blob
 | `eos` | Comma-separated end-of-sequence token ids (`-1` if none) |
 | `expert_fmt` | `q4b` or `q4` (format of the expert blocks; `q4` if absent) |
 
+Qwen3.5/3.6 packs add:
+
+| Key | Meaning |
+|---|---|
+| `arch` | `qwen35` (absent or `qwen3` for Qwen3-MoE) |
+| `layer_types` | One letter per layer: `L` Gated DeltaNet, `A` full attention (Qwen3.6-35B-A3B: `LLLA` × 10) |
+| `rotary_dim` | Dims at the start of each head that get RoPE (head_dim × partial_rotary_factor; 64 of 256) |
+| `lin_k_heads`, `lin_v_heads`, `lin_k_dim`, `lin_v_dim`, `conv_kernel` | DeltaNet sizes (16, 32, 128, 128, 4) |
+| `shared_ffn` | Width of the shared expert (512) |
+| `think_open` | `1`: the chat format opens `<think>\n` itself when thinking is on |
+
 ### Tensor names
 
 | Name | Shape | Format |
@@ -48,6 +59,27 @@ vocab <offset> <nbytes>                            the vocabulary blob
 | `L<n>.qn`, `L<n>.kn` | 1 × head_dim | f32 (Qwen3 per-head q/k norms) |
 | `L<n>.wq`, `L<n>.wk`, `L<n>.wv`, `L<n>.wo` | as in the model | q8 or q4b (`--dense-fmt`) |
 | `L<n>.router` | experts × hidden | f32 |
+
+Qwen3.5/3.6 packs store the zero-centred RMSNorm weights (`ln1`, `ln2`, `qn`, `kn`,
+`norm`) as `1 + w`, so every norm is `x_normed * weight` in the engine. Attention layers
+(`A`) have `qn`, `kn`, `wk`, `wv`, `wo` as above, and `wq` with 2 × heads × head_dim rows:
+for each head, its query rows followed by its output-gate rows. DeltaNet layers (`L`) have
+instead:
+
+| Name | Shape | Format |
+|---|---|---|
+| `L<n>.lqkv` | (2 × k_heads × k_dim + v_heads × v_dim) × hidden | q8 or q4b (`in_proj_qkv`: q, k, v) |
+| `L<n>.lz` | (v_heads × v_dim) × hidden | q8 or q4b (`in_proj_z`, output gate) |
+| `L<n>.lba` | (2 × v_heads) × hidden | f32 (`in_proj_b` rows, then `in_proj_a` rows) |
+| `L<n>.conv` | conv_dim × conv_kernel | f32 (depthwise causal convolution) |
+| `L<n>.alog`, `L<n>.dtb` | 1 × v_heads | f32 (`A_log`, `dt_bias`) |
+| `L<n>.lnorm` | 1 × v_dim | f32 (gated RMSNorm weight, used as is) |
+| `L<n>.lout` | hidden × (v_heads × v_dim) | q8 or q4b (`out_proj`) |
+
+Every Qwen3.5/3.6 layer also has the shared expert: `L<n>.sg`, `L<n>.su` (shared × hidden),
+`L<n>.sd` (hidden × shared) in the dense format, and `L<n>.sgate` (1 × hidden, f32). Its
+routed experts are stored like Qwen3's: the checkpoint's fused `gate_up_proj` is split
+into gate (first half of the rows) and up (second half).
 
 ## Tensor formats
 

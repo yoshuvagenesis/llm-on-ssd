@@ -1,6 +1,12 @@
-//! Qwen3-MoE forward pass, one token at a time.
-//! Dense weights (attention, routers, norms, output head) live in RAM.
-//! Expert weights come from the ExpertStore (SSD + LRU cache + prefetch).
+//! Forward pass for Qwen MoE models, layer by layer.
+//!
+//! - Qwen3-MoE: every layer is attention + MoE.
+//! - Qwen3.5/3.6-MoE: three of every four layers are Gated DeltaNet (a recurrent "linear
+//!   attention" with a fixed-size state), every fourth is gated full attention; every layer
+//!   ends in a MoE block with a shared expert.
+//!
+//! Dense weights (attention, DeltaNet, shared experts, routers, norms, output head) live
+//! in RAM. Expert weights come from the ExpertStore (SSD + LRU cache + prefetch).
 //! Embedding rows are read from the SSD per token.
 
 use crate::kernels::{axpy_bf16, dot_bf16, matvec, matvec_f32, to_bf16, QAct, QTensor, Scales, QK};
@@ -28,6 +34,31 @@ pub struct Config {
     pub norm_topk: bool,
     pub eos: Vec<u32>,
     pub expert_bf16_scales: bool,
+    pub qwen35: bool,       // Qwen3.5/3.6 layout (gated attention, DeltaNet, shared expert)
+    pub attn: Vec<bool>,    // per layer: full attention (true) or DeltaNet (false)
+    pub rot: usize,         // rotary dims at the start of each head (head_dim for Qwen3)
+    pub lin: LinCfg,        // DeltaNet sizes (Qwen3.5/3.6)
+    pub shared_ffn: usize,  // shared expert width (0 = none)
+    pub think_open: bool,   // chat format opens "<think>\n" itself when thinking is on
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LinCfg {
+    pub hk: usize, // key heads
+    pub hv: usize, // value heads
+    pub dk: usize,
+    pub dv: usize,
+    pub kc: usize, // conv kernel
+}
+
+impl LinCfg {
+    pub fn conv_dim(&self) -> usize {
+        2 * self.hk * self.dk + self.hv * self.dv
+    }
+    /// f32 values of one DeltaNet layer's state (recurrent matrix + conv history)
+    pub fn state_len(&self) -> usize {
+        self.hv * self.dk * self.dv + (self.kc - 1) * self.conv_dim()
+    }
 }
 
 enum OwnedScales {
@@ -61,16 +92,46 @@ impl QMat {
     }
 }
 
-struct Layer {
-    ln1: Vec<f32>,
-    ln2: Vec<f32>,
+struct Attn {
     qn: Vec<f32>,
     kn: Vec<f32>,
-    wq: QMat,
+    wq: QMat, // Qwen3.5: [query, gate] per head
     wk: QMat,
     wv: QMat,
     wo: QMat,
+}
+
+struct Lin {
+    qkv: QMat,      // in_proj_qkv
+    z: QMat,        // in_proj_z (output gate)
+    ba: Vec<f32>,   // in_proj_b then in_proj_a, f32 [2 * hv, hidden]
+    conv: Vec<f32>, // depthwise causal conv [conv_dim, kernel]
+    alog: Vec<f32>,
+    dtb: Vec<f32>,
+    norm: Vec<f32>, // gated RMSNorm weight [dv]
+    out: QMat,
+}
+
+struct Shared {
+    g: QMat,
+    u: QMat,
+    d: QMat,
+    gate: Vec<f32>, // [hidden]
+}
+
+struct Layer {
+    ln1: Vec<f32>,
+    ln2: Vec<f32>,
     router: Vec<f32>,
+    attn: Option<Attn>,
+    lin: Option<Lin>,
+    shared: Option<Shared>,
+}
+
+/// DeltaNet state saved at a point in the conversation, to return to it later
+struct Snapshot {
+    pos: usize,
+    state: Vec<Vec<f32>>,
 }
 
 pub struct Options {
@@ -103,8 +164,10 @@ pub struct Model {
     pub dense_bytes: usize,
     pub timing: Timing,
     // state
-    kcache: Vec<Vec<u16>>, // bf16
+    kcache: Vec<Vec<u16>>, // bf16, full-attention layers
     vcache: Vec<Vec<u16>>,
+    state: Vec<Vec<f32>>,  // DeltaNet layers: recurrent matrix, then conv history
+    snap: Option<Snapshot>,
     guesses: Vec<Vec<usize>>, // experts guessed for each layer during the current token
     pub pos: usize,
 }
@@ -193,6 +256,18 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
 fn topk(v: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
@@ -227,49 +302,62 @@ fn expert_views<'a>(buf: &'a Block, h: usize, f: usize, bf16: bool) -> [QTensor<
 
 impl Model {
     pub fn load(pack: Pack, store: Arc<ExpertStore>, opt: Options) -> io::Result<Model> {
-        let eos = pack
-            .cfg_str("eos")?
-            .split(',')
-            .filter_map(|s| s.parse::<i64>().ok())
-            .filter(|&v| v >= 0)
-            .map(|v| v as u32)
-            .collect();
-        let cfg = Config {
-            hidden: pack.cfg_usize("hidden_size")?,
-            layers: pack.cfg_usize("num_hidden_layers")?,
-            heads: pack.cfg_usize("num_attention_heads")?,
-            kv_heads: pack.cfg_usize("num_key_value_heads")?,
-            head_dim: pack.cfg_usize("head_dim")?,
-            experts: pack.cfg_usize("num_experts")?,
-            topk: pack.cfg_usize("num_experts_per_tok")?,
-            ffn: pack.cfg_usize("moe_intermediate_size")?,
-            eps: pack.cfg_f64("rms_norm_eps")? as f32,
-            theta: pack.cfg_f64("rope_theta")?,
-            vocab: pack.cfg_usize("vocab_size")?,
-            norm_topk: pack.cfg_usize("norm_topk_prob")? != 0,
-            eos,
-            expert_bf16_scales: match pack.cfg.get("expert_fmt").map(|s| s.as_str()) {
-                None | Some("q4") => false,
-                Some("q4b") => true,
-                Some(o) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown expert_fmt {o}"))),
-            },
-        };
+        let cfg = Self::config(&pack)?;
         let mut layers = Vec::with_capacity(cfg.layers);
         let mut dense_bytes = 0;
         for l in 0..cfg.layers {
             let n = |s: &str| format!("L{l}.{s}");
+            let attn = if cfg.attn[l] {
+                let a = Attn {
+                    qn: load_f32(&pack, &n("qn"))?,
+                    kn: load_f32(&pack, &n("kn"))?,
+                    wq: load_q(&pack, &n("wq"))?,
+                    wk: load_q(&pack, &n("wk"))?,
+                    wv: load_q(&pack, &n("wv"))?,
+                    wo: load_q(&pack, &n("wo"))?,
+                };
+                dense_bytes += a.wq.bytes() + a.wk.bytes() + a.wv.bytes() + a.wo.bytes();
+                Some(a)
+            } else {
+                None
+            };
+            let lin = if !cfg.attn[l] {
+                let a = Lin {
+                    qkv: load_q(&pack, &n("lqkv"))?,
+                    z: load_q(&pack, &n("lz"))?,
+                    ba: load_f32(&pack, &n("lba"))?,
+                    conv: load_f32(&pack, &n("conv"))?,
+                    alog: load_f32(&pack, &n("alog"))?,
+                    dtb: load_f32(&pack, &n("dtb"))?,
+                    norm: load_f32(&pack, &n("lnorm"))?,
+                    out: load_q(&pack, &n("lout"))?,
+                };
+                dense_bytes += a.qkv.bytes() + a.z.bytes() + a.out.bytes() + (a.ba.len() + a.conv.len()) * 4;
+                Some(a)
+            } else {
+                None
+            };
+            let shared = if cfg.shared_ffn > 0 {
+                let a = Shared {
+                    g: load_q(&pack, &n("sg"))?,
+                    u: load_q(&pack, &n("su"))?,
+                    d: load_q(&pack, &n("sd"))?,
+                    gate: load_f32(&pack, &n("sgate"))?,
+                };
+                dense_bytes += a.g.bytes() + a.u.bytes() + a.d.bytes() + a.gate.len() * 4;
+                Some(a)
+            } else {
+                None
+            };
             let ly = Layer {
                 ln1: load_f32(&pack, &n("ln1"))?,
                 ln2: load_f32(&pack, &n("ln2"))?,
-                qn: load_f32(&pack, &n("qn"))?,
-                kn: load_f32(&pack, &n("kn"))?,
-                wq: load_q(&pack, &n("wq"))?,
-                wk: load_q(&pack, &n("wk"))?,
-                wv: load_q(&pack, &n("wv"))?,
-                wo: load_q(&pack, &n("wo"))?,
                 router: load_f32(&pack, &n("router"))?,
+                attn,
+                lin,
+                shared,
             };
-            dense_bytes += ly.wq.bytes() + ly.wk.bytes() + ly.wv.bytes() + ly.wo.bytes() + ly.router.len() * 4;
+            dense_bytes += ly.router.len() * 4;
             layers.push(ly);
         }
         let norm = load_f32(&pack, "norm")?;
@@ -281,6 +369,7 @@ impl Model {
         }
         let embed_off = pack.data_start + et.off;
         let nl = cfg.layers;
+        let state = (0..nl).map(|l| if cfg.attn[l] { Vec::new() } else { vec![0f32; cfg.lin.state_len()] }).collect();
         let pool = Pool::new(opt.threads);
         Ok(Model {
             cfg,
@@ -296,9 +385,73 @@ impl Model {
             timing: Timing::default(),
             kcache: vec![Vec::new(); nl],
             vcache: vec![Vec::new(); nl],
+            state,
+            snap: None,
             guesses: vec![Vec::new(); nl],
             pos: 0,
         })
+    }
+
+    /// Model settings from a pack's header.
+    pub fn config(pack: &Pack) -> io::Result<Config> {
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let eos = pack
+            .cfg_str("eos")?
+            .split(',')
+            .filter_map(|s| s.parse::<i64>().ok())
+            .filter(|&v| v >= 0)
+            .map(|v| v as u32)
+            .collect();
+        let layers = pack.cfg_usize("num_hidden_layers")?;
+        let head_dim = pack.cfg_usize("head_dim")?;
+        let qwen35 = match pack.cfg.get("arch").map(|s| s.as_str()) {
+            None | Some("qwen3") => false,
+            Some("qwen35") => true,
+            Some(o) => return Err(bad(format!("unknown arch {o} (made by a newer converter?)"))),
+        };
+        let attn: Vec<bool> = match pack.cfg.get("layer_types") {
+            None => vec![true; layers],
+            Some(t) => t.chars().map(|c| c == 'A').collect(),
+        };
+        if attn.len() != layers {
+            return Err(bad("layer_types does not match num_hidden_layers".into()));
+        }
+        let opt = |k: &str| pack.cfg.get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let lin = LinCfg { hk: opt("lin_k_heads"), hv: opt("lin_v_heads"), dk: opt("lin_k_dim"), dv: opt("lin_v_dim"), kc: opt("conv_kernel") };
+        if attn.iter().any(|a| !a) && (lin.hk == 0 || lin.hv % lin.hk != 0 || lin.kc < 2) {
+            return Err(bad("DeltaNet layers need lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_kernel".into()));
+        }
+        Ok(Config {
+            hidden: pack.cfg_usize("hidden_size")?,
+            layers,
+            heads: pack.cfg_usize("num_attention_heads")?,
+            kv_heads: pack.cfg_usize("num_key_value_heads")?,
+            head_dim,
+            experts: pack.cfg_usize("num_experts")?,
+            topk: pack.cfg_usize("num_experts_per_tok")?,
+            ffn: pack.cfg_usize("moe_intermediate_size")?,
+            eps: pack.cfg_f64("rms_norm_eps")? as f32,
+            theta: pack.cfg_f64("rope_theta")?,
+            vocab: pack.cfg_usize("vocab_size")?,
+            norm_topk: pack.cfg_usize("norm_topk_prob")? != 0,
+            eos,
+            expert_bf16_scales: match pack.cfg.get("expert_fmt").map(|s| s.as_str()) {
+                None | Some("q4") => false,
+                Some("q4b") => true,
+                Some(o) => return Err(bad(format!("unknown expert_fmt {o}"))),
+            },
+            qwen35,
+            attn,
+            rot: if pack.cfg.contains_key("rotary_dim") { opt("rotary_dim") } else { head_dim },
+            lin,
+            shared_ffn: opt("shared_ffn"),
+            think_open: opt("think_open") != 0,
+        })
+    }
+
+    /// True if some layers keep a running state (DeltaNet) instead of a KV cache.
+    pub fn has_recurrent(&self) -> bool {
+        self.cfg.attn.iter().any(|a| !a)
     }
 
     fn embed(&self, tok: u32) -> io::Result<Vec<f32>> {
@@ -318,11 +471,27 @@ impl Model {
         (idx, w)
     }
 
-    /// Forget the conversation after the first `n` tokens (n = 0 starts fresh). The
-    /// KV cache keeps the first n positions, so a new message that repeats them
-    /// continues from there instead of reading everything again.
-    pub fn truncate(&mut self, n: usize) {
-        let n = n.min(self.pos);
+    /// Go back to the first `n` tokens of the conversation (0 = start fresh), so a new
+    /// message that repeats them continues from there. Returns how many tokens were kept.
+    /// Attention layers can go back anywhere (the KV cache is cut). DeltaNet layers keep a
+    /// running state that cannot be cut, so with them the model can only stay where it is
+    /// or return to its saved snapshot (if that is not past `n`), otherwise to the start.
+    pub fn truncate(&mut self, n: usize) -> usize {
+        let mut n = n.min(self.pos);
+        if self.has_recurrent() && n != self.pos {
+            match &self.snap {
+                Some(sn) if sn.pos <= n => {
+                    n = sn.pos;
+                    for (dst, src) in self.state.iter_mut().zip(&sn.state) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+                _ => {
+                    n = 0;
+                    self.state.iter_mut().for_each(|s| s.iter_mut().for_each(|v| *v = 0.0));
+                }
+            }
+        }
         let row = self.cfg.kv_heads * self.cfg.head_dim;
         for l in 0..self.cfg.layers {
             self.kcache[l].truncate(n * row);
@@ -330,6 +499,24 @@ impl Model {
             self.guesses[l].clear();
         }
         self.pos = n;
+        n
+    }
+
+    /// Remember the DeltaNet state at the current position (no-op for attention-only
+    /// models). `truncate` can later return here, e.g. to answer the same message again.
+    pub fn save_snapshot(&mut self) {
+        if !self.has_recurrent() {
+            return;
+        }
+        match &mut self.snap {
+            Some(sn) => {
+                sn.pos = self.pos;
+                for (dst, src) in sn.state.iter_mut().zip(&self.state) {
+                    dst.copy_from_slice(src);
+                }
+            }
+            None => self.snap = Some(Snapshot { pos: self.pos, state: self.state.clone() }),
+        }
     }
 
     /// Run one token (decode). Returns the logits for the next token.
@@ -354,10 +541,13 @@ impl Model {
         let scale = 1.0 / (hd as f32).sqrt();
 
         let mut hs: Vec<Vec<f32>> = toks.iter().map(|&t| self.embed(t)).collect::<io::Result<_>>()?;
-        let ropes: Vec<(Vec<f32>, Vec<f32>)> = (0..bt).map(|b| rope_table(pos0 + b, hd, theta)).collect();
+        let rot = self.cfg.rot;
+        let ropes: Vec<(Vec<f32>, Vec<f32>)> = (0..bt).map(|b| rope_table(pos0 + b, rot, theta)).collect();
+        let gated = self.cfg.qwen35; // Qwen3.5: q projection is [query, gate] per head
+        let qw = if gated { 2 * hd } else { hd };
         let mut xn = vec![0f32; hdim];
         let mut xa = QAct::new(hdim);
-        let mut qkv = vec![0f32; (nh + 2 * nkv) * hd];
+        let mut qkv = vec![0f32; nh * qw + 2 * nkv * hd];
         let mut att = vec![0f32; nh * hd];
         let mut atq = QAct::new(nh * hd);
         let mut o = vec![0f32; hdim];
@@ -372,58 +562,164 @@ impl Model {
             self.store.tick();
             let t0 = Instant::now();
             let ly = &self.layers[l];
-            let wo = ly.wo.view();
-            let stacked = [ly.wq.view(), ly.wk.view(), ly.wv.view()];
-            // ---- attention, token by token (each token sees the ones before it)
-            for b in 0..bt {
-                let h = &mut hs[b];
-                let (rc, rs) = (&ropes[b].0, &ropes[b].1);
-                rmsnorm(h, &ly.ln1, eps, &mut xn);
-                xa.set(&xn);
-                pool.chunks(&mut qkv, 16, |r0, out| matvec_stacked(&stacked, &xa, r0, out));
-                let (q, kv) = qkv.split_at_mut(nh * hd);
-                let (k, v) = kv.split_at_mut(kvd);
-                for hh in 0..nh {
-                    rmsnorm_inplace(&mut q[hh * hd..(hh + 1) * hd], &ly.qn, eps);
-                    rope(&mut q[hh * hd..(hh + 1) * hd], rc, rs);
-                }
-                for hh in 0..nkv {
-                    rmsnorm_inplace(&mut k[hh * hd..(hh + 1) * hd], &ly.kn, eps);
-                    rope(&mut k[hh * hd..(hh + 1) * hd], rc, rs);
-                }
-                // KV cache in bfloat16 (Qwen3's native precision): half the RAM
-                self.kcache[l].extend(k.iter().map(|&x| to_bf16(x)));
-                self.vcache[l].extend(v.iter().map(|&x| to_bf16(x)));
-                let (kc, vc) = (&self.kcache[l], &self.vcache[l]);
-                let npos = pos0 + b + 1;
-                let qref = &*q;
-                pool.chunks(&mut att, hd, |i0, out| {
-                    let mut sc = vec![0f32; npos];
-                    for (j, oh) in out.chunks_mut(hd).enumerate() {
-                        let hh = i0 / hd + j;
-                        let g = hh / (nh / nkv);
-                        let qh = &qref[hh * hd..(hh + 1) * hd];
-                        let mut m = f32::NEG_INFINITY;
-                        for p in 0..npos {
-                            let s = dot_bf16(qh, &kc[p * kvd + g * hd..p * kvd + (g + 1) * hd]) * scale;
-                            sc[p] = s;
-                            m = m.max(s);
+            if let Some(at) = &ly.attn {
+                let wo = at.wo.view();
+                let stacked = [at.wq.view(), at.wk.view(), at.wv.view()];
+                // ---- attention, token by token (each token sees the ones before it)
+                for b in 0..bt {
+                    let h = &mut hs[b];
+                    let (rc, rs) = (&ropes[b].0, &ropes[b].1);
+                    rmsnorm(h, &ly.ln1, eps, &mut xn);
+                    xa.set(&xn);
+                    pool.chunks(&mut qkv, 16, |r0, out| matvec_stacked(&stacked, &xa, r0, out));
+                    let (q, kv) = qkv.split_at_mut(nh * qw);
+                    let (k, v) = kv.split_at_mut(kvd);
+                    for hh in 0..nh {
+                        let qh = &mut q[hh * qw..hh * qw + hd];
+                        rmsnorm_inplace(qh, &at.qn, eps);
+                        rope(&mut qh[..rot], rc, rs);
+                    }
+                    for hh in 0..nkv {
+                        let kh = &mut k[hh * hd..(hh + 1) * hd];
+                        rmsnorm_inplace(kh, &at.kn, eps);
+                        rope(&mut kh[..rot], rc, rs);
+                    }
+                    // KV cache in bfloat16 (the models' native precision): half the RAM
+                    self.kcache[l].extend(k.iter().map(|&x| to_bf16(x)));
+                    self.vcache[l].extend(v.iter().map(|&x| to_bf16(x)));
+                    let (kc, vc) = (&self.kcache[l], &self.vcache[l]);
+                    let npos = pos0 + b + 1;
+                    let qref = &*q;
+                    pool.chunks(&mut att, hd, |i0, out| {
+                        let mut sc = vec![0f32; npos];
+                        for (j, oh) in out.chunks_mut(hd).enumerate() {
+                            let hh = i0 / hd + j;
+                            let g = hh / (nh / nkv);
+                            let qh = &qref[hh * qw..hh * qw + hd];
+                            let mut m = f32::NEG_INFINITY;
+                            for p in 0..npos {
+                                let s = dot_bf16(qh, &kc[p * kvd + g * hd..p * kvd + (g + 1) * hd]) * scale;
+                                sc[p] = s;
+                                m = m.max(s);
+                            }
+                            let mut tot = 0f32;
+                            for s in sc.iter_mut() {
+                                *s = (*s - m).exp();
+                                tot += *s;
+                            }
+                            oh.iter_mut().for_each(|x| *x = 0.0);
+                            for p in 0..npos {
+                                axpy_bf16(sc[p] / tot, &vc[p * kvd + g * hd..p * kvd + (g + 1) * hd], oh);
+                            }
                         }
-                        let mut tot = 0f32;
-                        for s in sc.iter_mut() {
-                            *s = (*s - m).exp();
-                            tot += *s;
-                        }
-                        oh.iter_mut().for_each(|x| *x = 0.0);
-                        for p in 0..npos {
-                            axpy_bf16(sc[p] / tot, &vc[p * kvd + g * hd..p * kvd + (g + 1) * hd], oh);
+                    });
+                    if gated {
+                        // Qwen3.5: output gate, sigmoid of the second half of each q head
+                        for hh in 0..nh {
+                            for i in 0..hd {
+                                att[hh * hd + i] *= sigmoid(q[hh * qw + hd + i]);
+                            }
                         }
                     }
-                });
-                atq.set(&att);
-                pool.chunks(&mut o, 16, |r0, out| matvec(&wo, &atq, r0, out));
-                for i in 0..hdim {
-                    h[i] += o[i];
+                    atq.set(&att);
+                    pool.chunks(&mut o, 16, |r0, out| matvec(&wo, &atq, r0, out));
+                    for i in 0..hdim {
+                        h[i] += o[i];
+                    }
+                }
+            } else {
+                // ---- Gated DeltaNet (Qwen3.5/3.6), token by token: a running state
+                // replaces the KV cache, so the cost per token does not grow with length
+                let li = ly.lin.as_ref().expect("DeltaNet layer without weights");
+                let lc = self.cfg.lin;
+                let (hk, hv, dk, dv, kc) = (lc.hk, lc.hv, lc.dk, lc.dv, lc.kc);
+                let (cd, kd, vd) = (lc.conv_dim(), hk * dk, hv * dv);
+                let stacked = [li.qkv.view(), li.z.view()];
+                let outw = li.out.view();
+                let mut proj = vec![0f32; cd + vd];
+                let mut ba = vec![0f32; 2 * hv];
+                let mut y = vec![0f32; cd];
+                let mut o_all = vec![0f32; vd];
+                let mut oq = QAct::new(vd);
+                let mut beta = vec![0f32; hv];
+                let mut decay = vec![0f32; hv];
+                let (smat, hist) = self.state[l].split_at_mut(hv * dk * dv);
+                let qscale = 1.0 / (dk as f32).sqrt();
+                for b in 0..bt {
+                    let h = &mut hs[b];
+                    rmsnorm(h, &ly.ln1, eps, &mut xn);
+                    xa.set(&xn);
+                    pool.chunks(&mut proj, 16, |r0, out| matvec_stacked(&stacked, &xa, r0, out));
+                    matvec_f32(&li.ba, hdim, &xn, &mut ba);
+                    // causal depthwise conv over the last `kc` inputs (oldest first), then silu
+                    let x = &proj[..cd];
+                    for c in 0..cd {
+                        let w = &li.conv[c * kc..(c + 1) * kc];
+                        let mut acc = 0f32;
+                        for j in 0..kc - 1 {
+                            acc += w[j] * hist[j * cd + c];
+                        }
+                        acc += w[kc - 1] * x[c];
+                        y[c] = silu(acc);
+                    }
+                    hist.copy_within(cd.., 0);
+                    hist[(kc - 2) * cd..].copy_from_slice(x);
+                    // l2-normalize q and k per key head; q also by 1/sqrt(dk)
+                    for hh in 0..2 * hk {
+                        let v = &mut y[hh * dk..(hh + 1) * dk];
+                        let r = 1.0 / (v.iter().map(|a| a * a).sum::<f32>() + 1e-6).sqrt();
+                        let f = if hh < hk { r * qscale } else { r };
+                        v.iter_mut().for_each(|a| *a *= f);
+                    }
+                    for hh in 0..hv {
+                        beta[hh] = sigmoid(ba[hh]);
+                        decay[hh] = (-li.alog[hh].exp() * softplus(ba[hv + hh] + li.dtb[hh])).exp();
+                    }
+                    // delta rule per value head (heads are independent), then gated RMSNorm
+                    {
+                        let (sbase, obase) = (smat.as_mut_ptr() as usize, o_all.as_mut_ptr() as usize);
+                        let (yr, pr, br, gr) = (&y, &proj, &beta, &decay);
+                        let rep = hv / hk;
+                        pool.run(hv, |hh| {
+                            // Safety: each task touches only its own head's state and output.
+                            let s = unsafe { std::slice::from_raw_parts_mut((sbase as *mut f32).add(hh * dk * dv), dk * dv) };
+                            let o = unsafe { std::slice::from_raw_parts_mut((obase as *mut f32).add(hh * dv), dv) };
+                            let kh = hh / rep; // key heads are shared by consecutive value heads
+                            let q = &yr[kh * dk..(kh + 1) * dk];
+                            let k = &yr[kd + kh * dk..kd + (kh + 1) * dk];
+                            let v = &yr[2 * kd + hh * dv..2 * kd + (hh + 1) * dv];
+                            let g = gr[hh];
+                            s.iter_mut().for_each(|a| *a *= g);
+                            let mut delta = vec![0f32; dv];
+                            for i in 0..dk {
+                                let ki = k[i];
+                                for (d, &sv) in delta.iter_mut().zip(&s[i * dv..(i + 1) * dv]) {
+                                    *d += sv * ki;
+                                }
+                            }
+                            for j in 0..dv {
+                                delta[j] = (v[j] - delta[j]) * br[hh];
+                            }
+                            o.iter_mut().for_each(|a| *a = 0.0);
+                            for i in 0..dk {
+                                let (ki, qi) = (k[i], q[i]);
+                                for ((sv, &d), ov) in s[i * dv..(i + 1) * dv].iter_mut().zip(&delta).zip(o.iter_mut()) {
+                                    *sv += ki * d;
+                                    *ov += *sv * qi;
+                                }
+                            }
+                            let z = &pr[cd + hh * dv..cd + (hh + 1) * dv];
+                            let r = 1.0 / (o.iter().map(|a| a * a).sum::<f32>() / dv as f32 + eps).sqrt();
+                            for j in 0..dv {
+                                o[j] = o[j] * r * li.norm[j] * silu(z[j]);
+                            }
+                        });
+                    }
+                    oq.set(&o_all);
+                    pool.chunks(&mut o, 16, |r0, out| matvec(&outw, &oq, r0, out));
+                    for i in 0..hdim {
+                        h[i] += o[i];
+                    }
                 }
             }
             let t1 = Instant::now();
@@ -496,6 +792,30 @@ impl Model {
             let t2 = Instant::now();
             self.timing.predict += (t2 - t1).as_secs_f64();
 
+            // ---- shared expert (Qwen3.5/3.6): weights in RAM, computed while the routed
+            // experts are being read; added after them, scaled by sigmoid(gate . x)
+            let mut sh_out: Vec<(f32, Vec<f32>)> = Vec::new();
+            if let Some(sh) = &self.layers[l].shared {
+                let fs = self.cfg.shared_ffn;
+                let gu = [sh.g.view(), sh.u.view()];
+                let dn = sh.d.view();
+                let mut gu_out = vec![0f32; 2 * fs];
+                let mut hm = vec![0f32; fs];
+                let mut hq = QAct::new(fs);
+                for b in 0..bt {
+                    pool.chunks(&mut gu_out, 16, |r0, out| matvec_stacked(&gu, &xq[b], r0, out));
+                    for i in 0..fs {
+                        hm[i] = silu(gu_out[i]) * gu_out[fs + i];
+                    }
+                    hq.set(&hm);
+                    let mut y = vec![0f32; hdim];
+                    pool.chunks(&mut y, 16, |r0, out| matvec(&dn, &hq, r0, out));
+                    let mut gl = [0f32; 1];
+                    matvec_f32(&sh.gate, hdim, &rx[b * (1 + la)], &mut gl);
+                    sh_out.push((sigmoid(gl[0]), y));
+                }
+            }
+
             // ---- experts: blocks already in RAM first, then in arrival order; each expert
             // is computed for all of its tokens as soon as its block is there
             order.sort_by_key(|&e| !self.store.is_ready(l * ne + e));
@@ -533,6 +853,11 @@ impl Model {
                     let y = &outs[b * kk + j];
                     for i in 0..hdim {
                         h[i] += w[j] * y[i];
+                    }
+                }
+                if let Some((g, y)) = sh_out.get(b) {
+                    for i in 0..hdim {
+                        h[i] += g * y[i];
                     }
                 }
             }

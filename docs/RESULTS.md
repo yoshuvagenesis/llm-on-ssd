@@ -1,7 +1,8 @@
 # Results
 
-All numbers below were measured by us. The raw output of the v0.5 release check is in
-[results/nas_n5105_v0.5_release_check.txt](results/nas_n5105_v0.5_release_check.txt).
+All numbers below were measured by us. The raw output of the release checks is in
+[results/nas_n5105_v0.5_release_check.txt](results/nas_n5105_v0.5_release_check.txt) and
+[results/nas_n5105_v0.7_release_check.txt](results/nas_n5105_v0.7_release_check.txt).
 
 ## Test machine
 
@@ -59,6 +60,39 @@ predicted at all.
 
 Heat: CPU peaks of 85–93 °C, SSDs at most 40 °C. The heat guard paused for 1 s in the
 fastest run and 20 s in the `--refine` run.
+
+## v0.7 on the N5105: Qwen3.6-35B-A3B
+
+[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), converted with
+`engine/tools/convert.py` (experts q4b, everything else 8-bit; 10,240 expert blocks of
+1.77 MB, 21.4 GB in total). Same machine, same 7 GB cap, same method; the 512-token
+prompt is built by the engine (`--bench-prompt 512 --bench-text trace/corpus.txt`).
+Qwen3 rows are from the same release check, for comparison.
+
+| Model and pack | Prompt reading | Generation | SSD read per token | Experts from RAM cache | Peak CPU |
+|---|---|---|---|---|---|
+| Qwen3-30B-A3B, 4-bit attention | 2.96 tok/s | **2.69 tok/s** | 180 MB | 79.0% | 88 °C |
+| Qwen3-30B-A3B, 8-bit attention | 3.35 tok/s | 2.17 tok/s | 283 MB | 73.5% | 88 °C |
+| **Qwen3.6-35B-A3B, 8-bit dense** | **3.09 tok/s** | **2.39 tok/s** | **136 MB** | 70.6% | **85 °C** |
+
+RAM plan for Qwen3.6 (all under the 7.0 GB cap): dense weights 2.26 GB + expert cache
+3.88 GB + conversation memory for 16,384 tokens 0.47 GB + other 0.40 GB.
+
+Where the time goes per generated token for Qwen3.6: attention and DeltaNet layers
+191 ms, experts 136 ms (of which about 66 ms waiting for the SSD), routers 33 ms, output
+head 57 ms. Unlike Qwen3, the SSD is no longer the main cost: most of the time is spent
+reading the always-in-RAM weights (about 1.3 GB per token for the layers and 0.5 GB for
+the 248k-word output head), so a 4-bit dense pack is the obvious next measurement.
+
+Quality: perplexity on the first 1,024 tokens of `trace/corpus.txt` (lower is better;
+each model uses its own tokenizer, so the numbers compare packs of the same model, not
+the two models):
+
+| Pack | Perplexity |
+|---|---|
+| Qwen3-30B-A3B, 8-bit attention | 7.372 |
+| Qwen3-30B-A3B, 4-bit attention | 7.878 (+6.9%) |
+| Qwen3.6-35B-A3B, 8-bit dense | 3.246 (first 512 tokens, measured on the Mac) |
 
 ## Real chat use (v0.6 chat server)
 

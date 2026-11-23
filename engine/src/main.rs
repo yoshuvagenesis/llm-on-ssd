@@ -12,8 +12,12 @@
 //!   --tokenizer f          the model's tokenizer.json (needed for text in: --serve, --prompt)
 //!
 //! Options
-//!   --prompt "text"        one user message (Qwen3 chat format); --think lets the model reason first
+//!   --prompt "text"        one user message (the model's chat format); --think lets it reason first
+//!   --bench-prompt N --bench-text f   benchmark prompt of exactly N tokens: "Summarize this text:"
+//!                          and the start of text file f, in the chat format (as tools/make_prompt.py)
 //!   --prompt-ids a,b,c | --prompt-file f   prompt token ids (comma/space separated)
+//!   --perplexity f         measure the model's perplexity on text file f (first --max-tokens
+//!                          tokens, default 2048) and exit: a quality check of the whole chain
 //!   --tokenize f           print the token ids of text file f and exit (needs --tokenizer;
 //!                          --no-special treats "<|im_start|>" etc. as plain text)
 //!   --max-new N            tokens to generate (default 64)
@@ -46,7 +50,7 @@ mod server;
 mod store;
 mod thermal;
 mod tokenizer;
-mod unicode_letters;
+mod unicode_data;
 
 use std::io::Write;
 use std::time::Instant;
@@ -149,9 +153,14 @@ fn main() {
         let text = std::fs::read_to_string(&f).expect("cannot read text file");
         if flag("--pieces") {
             // debugging: the pre-tokenizer's pieces, one JSON string per line
-            for p in tokenizer::pretokenize(&text) {
+            for p in tokenizer::pretokenize(&text, t.marks) {
                 println!("{}", json::esc(p));
             }
+            return;
+        }
+        if flag("--nfc") {
+            // debugging: the NFC-normalized text as one JSON string
+            println!("{}", json::esc(&tokenizer::nfc(&text)));
             return;
         }
         let ids = t.encode(&text, !flag("--no-special"));
@@ -164,24 +173,29 @@ fn main() {
         eprintln!("       moe-engine --pack model.moe --prompt-ids 1,2,3 [--max-new 64]");
         std::process::exit(1);
     };
-    let prompt: Vec<u32> = if let Some(text) = arg(&args, "--prompt") {
-        let Some(t) = &tok else {
-            eprintln!("--prompt needs --tokenizer tokenizer.json (or use --prompt-ids)");
-            std::process::exit(1)
-        };
-        let mut ids = t.encode("<|im_start|>user\n", true);
-        ids.extend(t.encode(&text, false));
-        ids.extend(t.encode("<|im_end|>\n<|im_start|>assistant\n", true));
-        if !flag("--think") {
-            ids.extend(t.encode("<think>\n\n</think>\n\n", true));
-        }
-        ids
+    let prompt_text = arg(&args, "--prompt");
+    if prompt_text.is_some() && tok.is_none() {
+        eprintln!("--prompt needs --tokenizer tokenizer.json (or use --prompt-ids)");
+        std::process::exit(1)
+    }
+    let bench_n: Option<usize> = arg(&args, "--bench-prompt").map(|v| v.parse().expect("bad --bench-prompt"));
+    if bench_n.is_some() && (tok.is_none() || arg(&args, "--bench-text").is_none()) {
+        eprintln!("--bench-prompt needs --tokenizer and --bench-text");
+        std::process::exit(1)
+    }
+    let mut prompt: Vec<u32> = if prompt_text.is_some() || bench_n.is_some() {
+        vec![0] // built below, once the model's chat format is known
     } else if let Some(f) = arg(&args, "--prompt-file") {
         parse_ids(&std::fs::read_to_string(f).expect("cannot read prompt file"))
     } else {
         parse_ids(&get("--prompt-ids", ""))
     };
-    if prompt.is_empty() && !serve {
+    let ppl_file = arg(&args, "--perplexity");
+    if ppl_file.is_some() && tok.is_none() {
+        eprintln!("--perplexity needs --tokenizer tokenizer.json");
+        std::process::exit(1);
+    }
+    if prompt.is_empty() && !serve && ppl_file.is_none() {
         eprintln!("no prompt given (--serve, --prompt, --prompt-ids or --prompt-file)");
         std::process::exit(1);
     }
@@ -191,7 +205,7 @@ fn main() {
     }
     let max_new: usize = get("--max-new", "64").parse().unwrap();
     let ram_gb: f64 = get("--ram-gb", "7").parse().unwrap();
-    let max_ctx: usize = get("--max-context", "4096").parse().unwrap();
+    let max_ctx_arg: Option<usize> = arg(&args, "--max-context").map(|v| v.parse().expect("bad --max-context"));
     let cache_req: Option<f64> = arg(&args, "--cache-gb").map(|v| v.parse().unwrap());
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let threads: usize = get("--threads", &cores.to_string()).parse().unwrap();
@@ -215,11 +229,48 @@ fn main() {
     });
     let blocks: Vec<(u64, usize)> = pk.experts.iter().map(|&(o, n)| (pk.data_start + o, n)).collect();
     let block_bytes = blocks[0].1;
+    let mcfg = model::Model::config(&pk).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1)
+    });
+    // default context: Qwen3.6's KV cache is small (only every 4th layer has one), so it
+    // gets a longer default conversation for about the same RAM
+    let max_ctx = max_ctx_arg.unwrap_or(if mcfg.qwen35 { 16384 } else { 4096 });
+    if let Some(text) = &prompt_text {
+        // one user message in the model's chat format; thinking off unless --think
+        let t = tok.as_ref().unwrap();
+        prompt = t.encode("<|im_start|>user\n", true);
+        prompt.extend(t.encode(if mcfg.think_open { text.trim() } else { text }, false));
+        prompt.extend(t.encode("<|im_end|>\n<|im_start|>assistant\n", true));
+        if !flag("--think") {
+            prompt.extend(t.encode("<think>\n\n</think>\n\n", true));
+        } else if mcfg.think_open {
+            prompt.extend(t.encode("<think>\n", true));
+        }
+    }
+    if let Some(n) = bench_n {
+        let t = tok.as_ref().unwrap();
+        let text = std::fs::read_to_string(arg(&args, "--bench-text").unwrap()).expect("cannot read --bench-text");
+        let head = t.encode("<|im_start|>user\nSummarize this text:\n\n", true);
+        let tail = t.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", true);
+        let body = t.encode(&text, true);
+        let need = n.saturating_sub(head.len() + tail.len());
+        if need == 0 || body.len() < need {
+            eprintln!("--bench-prompt {n}: text too short or N too small");
+            std::process::exit(1);
+        }
+        prompt = head;
+        prompt.extend_from_slice(&body[..need]);
+        prompt.extend(tail);
+    }
 
     // ---- RAM plan under the hard cap
-    let cfgu = |k: &str| pk.cfg_usize(k).unwrap_or(0);
     let dense: usize = pk.tensors.iter().filter(|(n, _)| n.as_str() != "embed").map(|(_, t)| t.nbytes).sum();
-    let kv = max_ctx * cfgu("num_hidden_layers") * 2 * cfgu("num_key_value_heads") * cfgu("head_dim") * 2;
+    // KV cache for the attention layers, plus the DeltaNet layers' fixed running state
+    // (twice: the live state and one saved snapshot)
+    let n_attn = mcfg.attn.iter().filter(|&&a| a).count();
+    let state_bytes = (mcfg.layers - n_attn) * mcfg.lin.state_len() * 4 * 2;
+    let kv = max_ctx * n_attn * 2 * mcfg.kv_heads * mcfg.head_dim * 2 + state_bytes;
     // buffers, vocabulary, thread stacks, the program itself; the tokenizer's tables
     let other = 300_000_000usize + if tok.is_some() { 100_000_000 } else { 0 };
     let budget = (ram_gb * 1e9) as i64 - (dense + kv + other) as i64;
@@ -227,7 +278,7 @@ fn main() {
         Some(g) => (g * 1e9) as usize,
         None => budget.max(0) as usize,
     };
-    let max_new = if serve {
+    let max_new = if serve || ppl_file.is_some() {
         max_new
     } else if prompt.len() + max_new > max_ctx {
         if prompt.len() >= max_ctx {
@@ -245,7 +296,7 @@ fn main() {
     let min_cache = min_slots * block_bytes.div_ceil(4096) * 4096;
     if (dense + kv + other + cache_bytes.max(min_cache)) as f64 > ram_gb * 1e9 {
         eprintln!(
-            "error: does not fit in --ram-gb {ram_gb}: attention/output {:.2} GB + KV for {max_ctx} tokens {:.2} GB + other {:.2} GB + expert cache {:.2} GB",
+            "error: does not fit in --ram-gb {ram_gb}: dense weights {:.2} GB + conversation memory for {max_ctx} tokens {:.2} GB + other {:.2} GB + expert cache {:.2} GB",
             dense as f64 / 1e9, kv as f64 / 1e9, other as f64 / 1e9, cache_bytes.max(min_cache) as f64 / 1e9
         );
         eprintln!("       lower --cache-gb or --max-context, or raise --ram-gb");
@@ -265,12 +316,18 @@ fn main() {
         });
     if !quiet {
         let c = &m.cfg;
+        let kind = if c.qwen35 {
+            let na = c.attn.iter().filter(|&&a| a).count();
+            format!("Qwen3.5/3.6-MoE, {} layers ({} DeltaNet + {} attention), shared expert", c.layers, c.layers - na, na)
+        } else {
+            format!("Qwen3-MoE, {} layers", c.layers)
+        };
         eprintln!(
-            "model: {} layers, {} experts (top-{}), hidden {}, vocab {} | kernels: {} | threads {} | io threads {}",
-            c.layers, c.experts, c.topk, c.hidden, c.vocab, simd, threads, io_threads
+            "model: {kind}, {} experts (top-{}), hidden {}, vocab {} | kernels: {} | threads {} | io threads {}",
+            c.experts, c.topk, c.hidden, c.vocab, simd, threads, io_threads
         );
         eprintln!(
-            "RAM (cap {:.1} GB): attention/output {:.2} + expert cache {:.2} ({} huge pages) + KV for {} tokens {:.2} + other {:.2} = {:.2} GB | expert block {:.2} MB | SSD reads: {}",
+            "RAM (cap {:.1} GB): dense weights {:.2} + expert cache {:.2} ({} huge pages) + conversation memory for {} tokens {:.2} + other {:.2} = {:.2} GB | expert block {:.2} MB | SSD reads: {}",
             ram_gb,
             m.dense_bytes as f64 / 1e9,
             store.cache_bytes() as f64 / 1e9,
@@ -290,6 +347,41 @@ fn main() {
             "heat guard: pause above CPU {}C / SSD {}C ({})",
             guard.max_cpu, guard.max_ssd, guard.sensors()
         );
+    }
+
+    if let Some(f) = &ppl_file {
+        // perplexity: exp(mean negative log-probability of each next token)
+        let text = std::fs::read_to_string(f).expect("cannot read text file");
+        let mut ids = tok.as_ref().unwrap().encode(&text, true);
+        let n: usize = get("--max-tokens", "2048").parse().expect("bad --max-tokens");
+        ids.truncate(n.min(max_ctx));
+        let t0 = Instant::now();
+        let (mut nll, mut count) = (0f64, 0usize);
+        // small chunks: every position's logits are kept until scored (vocab-sized each)
+        for (ci, chunk) in ids.chunks(64).enumerate() {
+            let out = m.forward_batch(chunk, true).expect("forward failed");
+            for (j, lg) in out.iter().enumerate() {
+                let i = ci * 64 + j;
+                if i + 1 >= ids.len() {
+                    break;
+                }
+                let mx = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let lse = mx + lg.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+                nll += lse - lg[ids[i + 1] as usize] as f64;
+                count += 1;
+            }
+            guard.check();
+            eprint!("\r{} / {} tokens", (ci * 64 + chunk.len()).min(ids.len()), ids.len());
+        }
+        eprintln!();
+        println!(
+            "perplexity {:.3} over {} tokens of {} ({:.0} s)",
+            (nll / count.max(1) as f64).exp(),
+            count,
+            f,
+            t0.elapsed().as_secs_f64()
+        );
+        return;
     }
 
     if serve {
@@ -314,6 +406,7 @@ fn main() {
             model_name,
             default_max_tokens: get("--max-answer", "1024").parse().expect("bad --max-answer"),
             ram_json,
+            qwen35: m.cfg.qwen35,
         };
         server::run(server::Engine { m, guard, vocab, tok: tok.unwrap() }, opts);
         return;

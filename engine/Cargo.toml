@@ -1,6 +1,6 @@
 [package]
 name = "moe-engine"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Storage-first MoE LLM inference: experts streamed from SSD, small RAM cache, CPU compute"

@@ -32,6 +32,7 @@ pub struct Opts {
     pub model_name: String,
     pub default_max_tokens: usize,
     pub ram_json: String, // RAM plan, already JSON
+    pub qwen35: bool,     // Qwen3.5/3.6 sampling defaults
 }
 
 // ------------------------------------------------------------------ jobs and status
@@ -44,6 +45,7 @@ struct Job {
     temp: f32,
     top_p: f32,
     top_k: usize,
+    presence: f32,
     seed: u64,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<Ev>,
@@ -164,15 +166,18 @@ fn render(e: &Engine, sp: &Special, ctx: &Ctx, msgs: &[(String, String)], think:
     let t = &e.tok;
     let nl = t.encode("\n", false);
     let empty_think = t.encode("<think>\n\n</think>\n\n", true);
+    // Qwen3.5/3.6's template trims message text and opens "<think>\n" itself when thinking
+    let q35 = e.m.cfg.think_open;
     let mut ids = Vec::new();
     for (role, content) in msgs {
+        let content = if q35 { content.trim() } else { content.as_str() };
         ids.push(sp.im_start);
         ids.extend(t.encode(&format!("{role}\n"), false));
         if role == "assistant" {
             // the model saw an empty thinking block before its answer (thinking off), so
             // history repeats it; the exact generated tokens are reused when known
             ids.extend(&empty_think);
-            match ctx.answers.iter().find(|(s, _)| s == content) {
+            match ctx.answers.iter().find(|(s, _)| s.as_str() == content) {
                 Some((_, a)) => ids.extend(a),
                 None => ids.extend(t.encode(content, false)),
             }
@@ -186,6 +191,8 @@ fn render(e: &Engine, sp: &Special, ctx: &Ctx, msgs: &[(String, String)], think:
     ids.extend(t.encode("assistant\n", false));
     if !think {
         ids.extend(&empty_think);
+    } else if q35 {
+        ids.extend(t.encode("<think>\n", true));
     }
     ids
 }
@@ -300,12 +307,13 @@ fn run_job(e: &mut Engine, sp: &Special, ctx: &mut Ctx, job: &Job, sh: &Shared) 
     }
     let max_new = job.max_tokens.min(max_ctx - prompt.len());
 
-    // reuse the common start of the KV cache
+    // reuse the common start of the conversation memory (models with DeltaNet layers can
+    // only continue where they are or go back to their snapshot; truncate says how far)
     let mut common = ctx.ids.iter().zip(&prompt).take_while(|(a, b)| a == b).count();
     if common == prompt.len() {
         common -= 1; // need at least one token to get fresh logits
     }
-    e.m.truncate(common);
+    let common = e.m.truncate(common);
     ctx.ids.truncate(common);
     let total = prompt.len() - common;
     {
@@ -329,9 +337,21 @@ fn run_job(e: &mut Engine, sp: &Special, ctx: &mut Ctx, job: &Job, sh: &Shared) 
     let t_read = Instant::now();
     let mut logits = Vec::new();
     let mut done = 0;
-    for chunk in prompt[common..].chunks(sh.opts.prefill_batch.max(1)) {
+    // with DeltaNet layers, read the prompt up to its last token, save a snapshot there
+    // (so the same message can be answered again without reading everything), then the
+    // last token; otherwise read it all in one go
+    let recurrent = e.m.has_recurrent();
+    let body_end = if recurrent { prompt.len() - 1 } else { prompt.len() };
+    let mut parts: Vec<&[u32]> = prompt[common..body_end].chunks(sh.opts.prefill_batch.max(1)).collect();
+    if recurrent {
+        parts.push(&prompt[body_end..]);
+    }
+    for chunk in parts {
         if job.cancel.load(Ordering::Relaxed) {
             return;
+        }
+        if recurrent && e.m.pos == body_end {
+            e.m.save_snapshot();
         }
         match e.m.forward_batch(chunk, false) {
             Ok(mut out) => logits = out.pop().unwrap(),
@@ -361,7 +381,8 @@ fn run_job(e: &mut Engine, sp: &Special, ctx: &mut Ctx, job: &Job, sh: &Shared) 
     let mut rng = Rng(job.seed);
     let mut gen_ids: Vec<u32> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
-    let mut in_think = false;
+    // Qwen3.5/3.6 open the thinking block in the prompt; Qwen3 writes "<think>" itself
+    let mut in_think = job.think && e.m.cfg.think_open;
     let mut content_started = false;
     let mut content_text = String::new();
     let mut finish = "length";
@@ -372,6 +393,14 @@ fn run_job(e: &mut Engine, sp: &Special, ctx: &mut Ctx, job: &Job, sh: &Shared) 
         if job.cancel.load(Ordering::Relaxed) {
             finish = "cancelled";
             break;
+        }
+        if job.presence != 0.0 {
+            // presence penalty: every token already in this answer gets a lower score once
+            for &t in &gen_ids {
+                if let Some(v) = logits.get_mut(t as usize) {
+                    *v -= job.presence;
+                }
+            }
         }
         let next = sample(&logits, job.temp, job.top_p, job.top_k, &mut rng);
         gen_ids.push(next);
@@ -421,6 +450,17 @@ fn run_job(e: &mut Engine, sp: &Special, ctx: &mut Ctx, job: &Job, sh: &Shared) 
             }
         }
         ctx.ids.push(next);
+    }
+    // bytes left over at the end (an incomplete character): send them as the terminal
+    // would show them, rather than dropping them
+    if !buf.is_empty() {
+        let rest = String::from_utf8_lossy(&buf).into_owned();
+        if in_think {
+            let _ = job.tx.send(Ev::Reasoning(rest));
+        } else {
+            content_text.push_str(&rest);
+            let _ = job.tx.send(Ev::Content(rest));
+        }
     }
     // remember the exact tokens of this answer (thinking off), so the next message that
     // repeats it in the history reuses the KV cache
@@ -564,11 +604,23 @@ fn chat(mut s: TcpStream, sh: &Arc<Shared>, body: &[u8]) -> std::io::Result<()> 
         .or_else(|| req.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")).and_then(J::as_bool))
         .unwrap_or(false);
     let num = |k: &str| req.get(k).and_then(J::as_f64);
-    // Qwen3's recommended sampling: thinking 0.6 / 0.95 / 20, otherwise 0.7 / 0.8 / 20
-    let temp = num("temperature").unwrap_or(if think { 0.6 } else { 0.7 }) as f32;
+    // the model makers' recommended sampling (top-k 20 for both):
+    //   Qwen3:   thinking 0.6 / top-p 0.95, otherwise 0.7 / 0.8
+    //   Qwen3.6: thinking 1.0 / 0.95, otherwise 0.7 / 0.8; presence penalty 1.5
+    let q35 = sh.opts.qwen35;
+    let temp = num("temperature").unwrap_or(match (think, q35) {
+        (true, true) => 1.0,
+        (true, false) => 0.6,
+        _ => 0.7,
+    }) as f32;
     let top_p = num("top_p").unwrap_or(if think { 0.95 } else { 0.8 }) as f32;
     let top_k = num("top_k").unwrap_or(20.0).max(0.0) as usize;
-    let max_tokens = num("max_completion_tokens").or_else(|| num("max_tokens")).map(|v| v.max(1.0) as usize).unwrap_or(sh.opts.default_max_tokens);
+    let presence = num("presence_penalty").unwrap_or(if q35 { 1.5 } else { 0.0 }) as f32;
+    // thinking needs room: by default it may use the whole remaining context
+    let max_tokens = num("max_completion_tokens")
+        .or_else(|| num("max_tokens"))
+        .map(|v| v.max(1.0) as usize)
+        .unwrap_or(if think { sh.opts.max_ctx } else { sh.opts.default_max_tokens });
     let seed = num("seed").map(|v| v as u64).unwrap_or_else(|| {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
     });
@@ -579,7 +631,7 @@ fn chat(mut s: TcpStream, sh: &Arc<Shared>, body: &[u8]) -> std::io::Result<()> 
     let id = sh.next_id.fetch_add(1, Ordering::Relaxed);
     {
         let mut q = sh.queue.lock().unwrap();
-        q.push_back(Job { id, msgs, think, max_tokens, temp, top_p, top_k, seed, cancel: cancel.clone(), tx });
+        q.push_back(Job { id, msgs, think, max_tokens, temp, top_p, top_k, presence, seed, cancel: cancel.clone(), tx });
         sh.cv.notify_all();
     }
     let cid = format!("chatcmpl-{id}");

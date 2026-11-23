@@ -23,10 +23,11 @@ python3 -m pip install numpy tokenizers huggingface_hub
 ## 1. Download the model
 
 ```bash
-huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ~/models/Qwen3-30B-A3B
+hf download Qwen/Qwen3-30B-A3B --local-dir ~/models/Qwen3-30B-A3B
 ```
 
 The model is Apache-2.0. Downloads resume if they are interrupted; run the command again.
+(Older versions of `huggingface_hub` call the command `huggingface-cli download`.)
 
 ## 2. Convert it into two packs
 
@@ -112,7 +113,38 @@ python3 tools/test_engine.py              # must end with ENGINE TEST PASSED
 `--ram-gb` limits the engine's own allocations. A container limit (or a cgroup) also
 makes sure nothing else on the machine counts against it.
 
-## 8. Optional: the research measurements
+## 8. Check quality: perplexity
+
+`--perplexity` measures how well the model predicts a text, here `trace/corpus.txt`. It
+runs the whole chain (tokenizer, pack, engine), so it is the best single check that a
+conversion is correct: a mistake shows up as a much higher number.
+
+```bash
+docker run --rm --memory 7g --entrypoint moe-engine -v /ssd/moe:/models moe-bench \
+    --pack /models/qwen3-30b-a3b.moe --tokenizer /models/tokenizer.json \
+    --perplexity /kit/trace/corpus.txt --max-tokens 2048
+```
+
+For Qwen3-30B-A3B with 4-bit experts, `trace/quant_sweep.py` measured 6.2 on this text,
+so expect a value close to that (the engine's 8-bit activations add a little).
+
+## 9. Qwen3.6-35B-A3B
+
+The same steps work for Qwen3.6. Its tokenizer differs from Qwen3's, so keep it under its
+own name:
+
+```bash
+hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/models/Qwen3.6-35B-A3B           # about 70 GB
+python3 engine/tools/verify_tokenizer.py --tokenizer ~/models/Qwen3.6-35B-A3B/tokenizer.json
+python3 engine/tools/convert.py --model ~/models/Qwen3.6-35B-A3B --out ~/models/qwen3.6-35b-a3b.moe
+cp ~/models/Qwen3.6-35B-A3B/tokenizer.json ~/models/tokenizer-qwen3.6.json
+```
+
+Conversion takes roughly 30–60 minutes and writes a pack of about 21 GB. With
+`--dense-fmt q4b` the always-in-RAM part shrinks from about 2.3 GB to 1.2 GB, which leaves
+more RAM for the expert cache; measure the quality cost with `--perplexity`.
+
+## 10. Optional: the research measurements
 
 These were run on a Mac (Apple M2, 16 GB). They read the original model, not a pack.
 

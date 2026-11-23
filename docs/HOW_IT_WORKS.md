@@ -152,3 +152,30 @@ within its specification. The SSDs stayed below 41 °C because they are only rea
   conversations at once would also split the SSD bandwidth that each token needs.
 - **Statistics.** `/api/stats` reports the queue, progress, speed, temperatures, the RAM
   plan and cache use. The page polls it every second.
+
+## 12. Qwen3.6: a hybrid model
+
+Qwen3.6-35B-A3B (and Qwen3.5) replaces most attention layers with **Gated DeltaNet**.
+Of its 40 layers, 30 are DeltaNet and 10 are full attention.
+
+- **DeltaNet** keeps, per head, a 128 × 128 matrix that summarizes everything read so far.
+  Each token decays it, reads from it, corrects it by the "delta rule", and reads the
+  output from it. A short causal convolution and gates come before; a gated RMSNorm after.
+  The work per token is the same whether the conversation is 10 or 10,000 tokens long.
+  Only the 10 attention layers look back over all tokens, which is why long chats slow
+  down much less than with Qwen3 (measured with random weights at full size: +10% layer
+  time after 512 tokens).
+- **Memory**: the KV cache exists for 10 layers only (about 20 KB per token), plus a fixed
+  60 MB of DeltaNet state. That is why the default context is 16,384 tokens.
+- **Rewinding**: a KV cache can be cut back to any point; a DeltaNet state cannot. The
+  engine saves the state once per request, right before the prompt's last token. Asking
+  the same message again returns there and reads one token; continuing a chat simply goes
+  on; a different conversation starts from zero.
+- **Experts**: 256 per layer, 8 used per token, plus one shared expert that every token
+  uses. The shared expert's weights stay in RAM and are computed while the routed experts
+  arrive from the SSD. A routed expert is 1.77 MB at 4.5 bits, so a token needs at most
+  about 570 MB from the SSD; the cache serves most of it.
+- **Checked twice**: `trace/qwen35_ref.py` reads the checkpoint in its original
+  Hugging Face layout and follows the transformers implementation; `engine/tools/ref_pack.py`
+  reads the converted pack with the engine's exact rounding. With rounding off, the two
+  agree to float32 precision; with rounding on, the engine matches `ref_pack.py`.

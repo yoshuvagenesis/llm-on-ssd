@@ -16,6 +16,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "trace"))
+import qwen35_ref  # noqa: E402  (Qwen3.5/3.6 tiny-model builder + independent HF-layout reference)
 import selftest  # noqa: E402  (tiny-model builder)
 
 import ref_pack  # noqa: E402
@@ -65,18 +66,48 @@ def compare(a, b):
 def main():
     ok = True
     for fmt, dense in (("q4b", "q8"), ("q4", "q8"), ("q4b", "q4b")):
-        print(f"===== experts {fmt}, attention/output head {dense}")
+        print(f"===== Qwen3-MoE: experts {fmt}, attention/output head {dense}")
         ok &= run_format(fmt, dense)
+    for fmt, dense in (("q4b", "q8"), ("q4b", "q4b")):
+        print(f"===== Qwen3.5/3.6-MoE (DeltaNet + gated attention + shared expert): experts {fmt}, dense {dense}")
+        ok &= run_format(fmt, dense, arch="qwen35")
+    ok &= check_references()
     print("ENGINE TEST PASSED" if ok else "ENGINE TEST FAILED")
     sys.exit(0 if ok else 1)
 
 
-def run_format(fmt, dense):
+def check_references():
+    """The pack reference (with the engine's rounding switched off) must compute the same as
+    the independent reference that reads the Hugging Face checkpoint directly. A calm random
+    model (small weights) keeps float32-vs-float64 differences from being amplified."""
+    print("===== independent check: pack reference vs Hugging Face-layout reference (Qwen3.5/3.6)")
+    with tempfile.TemporaryDirectory() as d:
+        qwen35_ref.build(d, np.random.default_rng(1), scale=0.05)
+        pack = os.path.join(d, "tiny.moe")
+        subprocess.run([sys.executable, os.path.join(HERE, "convert.py"), "--model", d, "--out", pack],
+                       check=True, stdout=subprocess.DEVNULL)
+        ref_pack.ROUND = False
+        try:
+            a, b = ref_pack.Ref(pack), qwen35_ref.HFRef(d, dense_fmt="q8", expert_fmt="q4b")
+            ids = np.random.default_rng(5).integers(0, qwen35_ref.TEXT["vocab_size"], 12)
+            err = max(float(np.abs(x - y).max() / np.abs(y).max())
+                      for x, y in ((a.forward(int(t)), b.forward(int(t))) for t in ids))
+        finally:
+            ref_pack.ROUND = True
+        good = err < 1e-4
+        print(f"   {'OK ' if good else 'FAIL'} 12 steps, max difference {err:.1e} (float32 vs float64 rounding only)")
+        return good
+
+
+def run_format(fmt, dense, arch="qwen3"):
     ok = True
     with tempfile.TemporaryDirectory() as d:
-        selftest.CFG.clear()
-        selftest.CFG.update(CFG)
-        selftest.build(d, np.random.default_rng(11))
+        if arch == "qwen35":
+            qwen35_ref.build(d, np.random.default_rng(11))
+        else:
+            selftest.CFG.clear()
+            selftest.CFG.update(CFG)
+            selftest.build(d, np.random.default_rng(11))
         pack = os.path.join(d, "tiny.moe")
         subprocess.run([sys.executable, os.path.join(HERE, "convert.py"), "--model", d, "--out", pack,
                         "--expert-fmt", fmt, "--dense-fmt", dense], check=True, stdout=subprocess.DEVNULL)

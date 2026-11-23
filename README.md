@@ -7,8 +7,10 @@ an NVMe SSD and streams each expert into RAM only when it is needed. It is built
 hardware ordinary people already have: a low-power quad-core CPU without AVX2, one SSD,
 and 8 GB of RAM.
 
-Reference setup: **Qwen3-30B-A3B** (30.5B parameters, 3.3B active per token) on an
-**Intel Celeron N5105** NAS (4 cores, no AVX/AVX2/FMA, NVMe drives on PCIe 3.0 x1).
+Supported models: **Qwen3.6-35B-A3B** (and Qwen3.5-35B-A3B), **Qwen3-30B-A3B** and
+**Qwen3-Coder-30B-A3B**. Reference setup: Qwen3-30B-A3B (30.5B parameters, 3.3B active
+per token) on an **Intel Celeron N5105** NAS (4 cores, no AVX/AVX2/FMA, NVMe drives on
+PCIe 3.0 x1).
 
 | On the same N5105 box, 512-token prompt, 128 generated tokens | RAM | Prompt reading | Generation |
 |---|---|---|---|
@@ -26,8 +28,9 @@ from RAM. Full numbers, conditions and the raw log are in [docs/RESULTS.md](docs
 It comes with a **chat page and an OpenAI-compatible API**: start it once on the
 machine with the SSD, then chat from any phone or computer on your home network.
 
-> **Status: research prototype.** It works and it is tested, but it supports one model
-> family (Qwen3-MoE) and has fast kernels only for x86-64. See [Limitations](#limitations).
+> **Status: research prototype.** It works and it is tested, but it supports two model
+> families (Qwen3-MoE and Qwen3.5/3.6-MoE) and has fast kernels only for x86-64. See
+> [Limitations](#limitations).
 
 ## Why this works
 
@@ -68,7 +71,7 @@ git clone https://github.com/yoshuvagenesis/llm-on-ssd && cd llm-on-ssd
 
 # 1. Get the model (Apache-2.0, about 61 GB) and convert it to a pack (about 18 GB)
 pip install numpy huggingface_hub
-huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ~/models/Qwen3-30B-A3B
+hf download Qwen/Qwen3-30B-A3B --local-dir ~/models/Qwen3-30B-A3B
 python engine/tools/convert.py --model ~/models/Qwen3-30B-A3B --out /ssd/qwen3-q4b-d4.moe --dense-fmt q4b
 cp ~/models/Qwen3-30B-A3B/tokenizer.json /ssd/
 
@@ -76,6 +79,12 @@ cp ~/models/Qwen3-30B-A3B/tokenizer.json /ssd/
 docker build -t moe-bench -f docker/Dockerfile .
 MODELS=/ssd sh docker/serve.sh
 ```
+
+For **Qwen3.6-35B-A3B** (newer and stronger; its download is about 70 GB and its pack about
+21 GB), download `Qwen/Qwen3.6-35B-A3B` the same way, convert it to
+`/ssd/qwen3.6-35b-a3b.moe`, copy its `tokenizer.json` to `/ssd/tokenizer-qwen3.6.json`
+(it differs from Qwen3's), and start the server with
+`MODELS=/ssd PACK=qwen3.6-35b-a3b.moe TOKENIZER=tokenizer-qwen3.6.json sh docker/serve.sh`.
 
 Then open `http://<the machine's IP address>:8080` in a browser on any device in your
 home network. Answers appear word by word. A panel shows the queue, speed, temperatures,
@@ -110,16 +119,17 @@ exact benchmark, are in [docs/REPRODUCE.md](docs/REPRODUCE.md).
 
 ## Limitations
 
-- **One model family**: Qwen3-MoE (Qwen3-30B-A3B is the reference). Other MoE models
-  need converter and engine work.
+- **Two model families**: Qwen3-MoE and Qwen3.5/3.6-MoE (text only; the vision part of
+  Qwen3.5/3.6 is not converted). Other MoE models need converter and engine work.
 - **One answer at a time.** Requests wait in line; the page shows the place in line and
   an estimated wait. When a different conversation takes its turn, the engine reads that
   conversation again (about 2 minutes per 500 tokens on the N5105); continuing the same
-  conversation reuses what is already in memory.
+  conversation reuses what is already in memory, and so does asking the same message again.
 - **Fast kernels are x86-64 SSE only.** It runs correctly on ARM, including Apple
   Silicon, but slowly.
-- **Context** up to `--max-context` tokens (default 4096, about 3,000 words). When a
-  conversation gets longer, its oldest messages are left out, and the page says so.
+- **Context** up to `--max-context` tokens (default 4,096 for Qwen3 and 16,384 for
+  Qwen3.6, whose memory per token is 5× smaller). When a conversation gets longer, its
+  oldest messages are left out, and the page says so.
 - **Quality**: experts are stored at 4.5 bits per weight, which costs about 3% in
   perplexity (6.21 vs 6.01). See [docs/RESULTS.md](docs/RESULTS.md#quality).
 - **Heat**: generation keeps the CPU fully busy. On our NAS the CPU reached

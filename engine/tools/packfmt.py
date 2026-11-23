@@ -123,6 +123,22 @@ def encode(fmt, w):
     raise ValueError(fmt)
 
 
+def encode_large(fmt, w, rows_per=16384):
+    """encode() in chunks of rows (same bytes), so huge matrices such as a 248k-row output
+    head do not need several full-size temporary copies in RAM."""
+    rows = w.shape[0]
+    if fmt in ("f32", "bf16") or rows <= rows_per:
+        return encode(fmt, w)
+    vals, scales = [], []
+    for r0 in range(0, rows, rows_per):
+        chunk = w[r0:r0 + rows_per]
+        part = encode(fmt, chunk)
+        nv = chunk.shape[0] * chunk.shape[1] // (1 if fmt == "q8" else 2)  # values come before scales
+        vals.append(part[:nv])
+        scales.append(part[nv:])
+    return b"".join(vals) + b"".join(scales)
+
+
 def decode(fmt, buf, rows, cols):
     """bytes -> dequantized float32 [rows, cols] (used by the reference)."""
     nb = cols // QK

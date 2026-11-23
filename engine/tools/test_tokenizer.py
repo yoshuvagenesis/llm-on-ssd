@@ -1,9 +1,11 @@
 """Check the engine's tokenizer without Hugging Face libraries.
 
-1. Pre-tokenizer: compares the engine's pieces with Python's `re` running Qwen's split
-   pattern, with \\p{L}, \\p{N} and \\s expanded into explicit Unicode classes.
-2. BPE: builds a small byte-level BPE tokenizer.json trained on the test text, and
-   compares the engine's token ids with a straightforward Python BPE.
+For both split rules (Qwen2/Qwen3's, and Qwen3.5/3.6's with combining marks):
+1. Pre-tokenizer: compares the engine's pieces with Python's `re` running the split
+   pattern, with \\p{L}, \\p{M}, \\p{N} and \\s expanded into explicit Unicode classes.
+2. NFC: compares the engine's normalization with Python's unicodedata.normalize.
+3. BPE: builds a small byte-level BPE tokenizer.json trained on the test text, and
+   compares the engine's token ids with a straightforward Python BPE (after NFC).
 
   python3 tools/test_tokenizer.py [path/to/moe-engine]
 
@@ -22,6 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "target", "release", "moe-engine")
 QWEN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
         r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+QWEN35 = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+          r"|\s*[\r\n]+|\s+(?!\S)|\s+")
 
 # Unicode White_Space (what Oniguruma and Rust use for \s)
 WHITE_SPACE = [0x9, 0xA, 0xB, 0xC, 0xD, 0x20, 0x85, 0xA0, 0x1680] + list(range(0x2000, 0x200B)) + \
@@ -42,11 +46,22 @@ def cls(pred):
 
 
 L = cls(lambda c: unicodedata.category(chr(c)).startswith("L"))
+M = cls(lambda c: unicodedata.category(chr(c)).startswith("M"))
 N = cls(lambda c: unicodedata.category(chr(c)).startswith("N"))
 S = "".join(re.escape(chr(c)) for c in WHITE_SPACE)
-pat = QWEN.replace(r"[^\r\n\p{L}\p{N}]", f"[^\\r\\n{L}{N}]").replace(r"[^\s\p{L}\p{N}]", f"[^{S}{L}{N}]")
-pat = pat.replace(r"\p{L}", f"[{L}]").replace(r"\p{N}", f"[{N}]").replace(r"\s", f"[{S}]").replace(r"\S", f"[^{S}]")
-SPLIT = re.compile(pat)
+
+
+def compile_split(pattern):
+    """Python `re` version of a Qwen split pattern, Unicode classes spelled out."""
+    p = pattern
+    p = p.replace(r"[^\r\n\p{L}\p{N}]", f"[^\\r\\n{L}{N}]")
+    p = p.replace(r"[^\s\p{L}\p{M}\p{N}]", f"[^{S}{L}{M}{N}]").replace(r"[^\s\p{L}\p{N}]", f"[^{S}{L}{N}]")
+    p = p.replace(r"[\p{L}\p{M}]", f"[{L}{M}]")
+    p = p.replace(r"\p{L}", f"[{L}]").replace(r"\p{N}", f"[{N}]").replace(r"\s", f"[{S}]").replace(r"\S", f"[^{S}]")
+    return re.compile(p)
+
+
+SPLIT = compile_split(QWEN)
 
 TEXTS = [
     "Hello world! Don't stop, I'M sure they'll come. We've got it, you'd see. It'S fine.",
@@ -66,6 +81,10 @@ TEXTS = [
     "    ",
     "end with space ",
     "x",
+    # decomposed forms (NFC changes these) and scripts with many combining marks
+    "Cafe\u0301 nai\u0308ve, A\u030angstro\u0308m, Vie\u0323\u0302t Nam, \u1100\u1161\u11a8 \u1112\u1161\u11ab",
+    "q\u0307\u0323 x\u0323\u0307 e\u0301\u0327 \u0301start, \u0915\u093c\u093f \u0b95\u0bc6\u0bbe \u0b95\u0bca",
+    "ไทย ภาษาไทย ที่ ผู้ใหญ่, ລາວ, ខ្មែរ, မြန်မာ, སྐད, ꦗꦮ, 𑀩𑁆𑀭𑀸𑀳𑁆𑀫𑀻",
 ]
 
 
@@ -146,20 +165,34 @@ def py_bpe(piece, ranks):
     return word
 
 
-def main():
+def main(pattern, name):
+    global SPLIT
+    SPLIT = compile_split(pattern)
+    tok = make_tokenizer(pattern)
     corpus = open(os.path.join(HERE, "..", "..", "trace", "corpus.txt"), encoding="utf-8").read()
     texts = TEXTS + [corpus]
     fails = 0
+    print(f"== {name} split rule")
 
     # 1. pre-tokenizer
     for t in texts:
-        want = SPLIT.findall(t)
-        got = [json.loads(l) for l in engine(["--tokenizer", TOK, "--pieces"], t).split("\n") if l]
+        want = SPLIT.findall(t)  # pieces are compared on the text as given (before NFC)
+        got = [json.loads(l) for l in engine(["--tokenizer", tok, "--pieces"], t).split("\n") if l]
         if want != got:
             fails += 1
             k = next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), min(len(want), len(got)))
             print(f"FAIL pieces for {t[:40]!r}: first difference at piece {k}: want {want[k:k+3]!r} got {got[k:k+3]!r}")
     print(f"pre-tokenizer: {len(texts) - fails}/{len(texts)} texts identical to Python re")
+
+    # 2. NFC
+    nbad = 0
+    for t in texts + NFC_EXTRA:
+        got = json.loads(engine(["--tokenizer", tok, "--nfc"], t).strip())
+        if got != unicodedata.normalize("NFC", t):
+            nbad += 1
+            print(f"FAIL NFC for {t[:40]!r}")
+    print(f"NFC: {len(texts) + len(NFC_EXTRA) - nbad}/{len(texts) + len(NFC_EXTRA)} texts identical to Python")
+    fails += nbad
 
     # 2. BPE ids, with and without special tokens
     bad = 0
@@ -175,41 +208,60 @@ def main():
                 if special and part in SPECIAL:
                     want.append(SPECIAL[part])
                     continue
-                for p in SPLIT.findall(part):
+                for p in SPLIT.findall(unicodedata.normalize("NFC", part)):
                     want += [VOCAB[s] for s in py_bpe(p, RANKS)]
-            args = ["--tokenizer", TOK] + ([] if special else ["--no-special"])
+            args = ["--tokenizer", tok] + ([] if special else ["--no-special"])
             got = [int(x) for x in engine(args, t).strip().split(",") if x]
             if want != got:
                 bad += 1
                 k = next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), min(len(want), len(got)))
                 print(f"FAIL ids for {t[:40]!r} (special={special}): first difference at {k}")
     print(f"BPE: {2 * len(texts) - bad}/{2 * len(texts)} encodings identical")
-    if fails or bad:
-        print("TOKENIZER TEST FAILED")
-        sys.exit(1)
-    print("TOKENIZER TEST PASSED")
+    return fails + bad
 
 
-if __name__ == "__main__":
-    corpus = open(os.path.join(HERE, "..", "..", "trace", "corpus.txt"), encoding="utf-8").read()
-    merges = train(TEXTS + [corpus[:20000]], 3000)
-    VOCAB = {}
-    for b in range(256):
-        VOCAB[B2U[b]] = len(VOCAB)
-    for a, b in merges:
-        if a + b not in VOCAB:
-            VOCAB[a + b] = len(VOCAB)
-    RANKS = {m: i for i, m in enumerate(merges)}
-    SPECIAL = {s: len(VOCAB) + i for i, s in enumerate(["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"])}
+# extra NFC cases: random sequences of letters and combining marks
+def nfc_extra():
+    import random
+    rng = random.Random(7)
+    bases = "aeiouAEIOUcnsyzkgqwxCNSYZ\u0915\u0b95\u0e01\u1100\u1161\u11a8\uac00\u0391\u0410 "
+    marks = ["\u0300", "\u0301", "\u0302", "\u0303", "\u0308", "\u030a", "\u0323", "\u0327", "\u0328",
+             "\u031b", "\u0345", "\u093c", "\u094d", "\u0bcd", "\u0bbe", "\u0bc6", "\u0e48", "\u05b4",
+             "\u0651", "\u0654", "\u1161", "\u11a8", "\u0342", "\u0313"]
+    out = []
+    for _ in range(300):
+        s = "".join(rng.choice(bases) + "".join(rng.choice(marks) for _ in range(rng.randint(0, 3)))
+                    for _ in range(rng.randint(1, 12)))
+        out.append(s)
+    return out
+
+
+def make_tokenizer(pattern):
     tj = {
         "added_tokens": [{"id": i, "content": s, "special": True} for s, i in SPECIAL.items()],
         "normalizer": {"type": "NFC"},
         "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-            {"type": "Split", "pattern": {"Regex": QWEN}, "behavior": "Isolated", "invert": False},
+            {"type": "Split", "pattern": {"Regex": pattern}, "behavior": "Isolated", "invert": False},
             {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": False, "use_regex": False}]},
-        "model": {"type": "BPE", "vocab": VOCAB, "merges": [[a, b] for a, b in merges]},
+        "model": {"type": "BPE", "vocab": VOCAB, "merges": [[a, b] for a, b in MERGES]},
     }
-    d = tempfile.mkdtemp()
-    TOK = os.path.join(d, "tokenizer.json")
-    json.dump(tj, open(TOK, "w", encoding="utf-8"), ensure_ascii=False)
-    main()
+    path = os.path.join(tempfile.mkdtemp(), "tokenizer.json")
+    json.dump(tj, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    return path
+
+
+if __name__ == "__main__":
+    corpus = open(os.path.join(HERE, "..", "..", "trace", "corpus.txt"), encoding="utf-8").read()
+    MERGES = train(TEXTS + [corpus[:20000]], 3000)
+    VOCAB = {}
+    for b in range(256):
+        VOCAB[B2U[b]] = len(VOCAB)
+    for a, b in MERGES:
+        if a + b not in VOCAB:
+            VOCAB[a + b] = len(VOCAB)
+    RANKS = {m: i for i, m in enumerate(MERGES)}
+    SPECIAL = {s: len(VOCAB) + i for i, s in enumerate(["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"])}
+    NFC_EXTRA = nfc_extra()
+    bad = main(QWEN, "Qwen2/Qwen3") + main(QWEN35, "Qwen3.5/3.6")
+    print("TOKENIZER TEST PASSED" if not bad else "TOKENIZER TEST FAILED")
+    sys.exit(1 if bad else 0)

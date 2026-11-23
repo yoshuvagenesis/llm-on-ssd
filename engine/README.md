@@ -1,4 +1,4 @@
-# moe-engine v0.6: storage-first MoE inference
+# moe-engine v0.7: storage-first MoE inference
 
 Runs Qwen3-MoE models (reference: Qwen3-30B-A3B) with the experts streamed from the
 SSD. RAM holds only the attention weights, routers and output head (~1.4 GB), the KV
@@ -6,7 +6,31 @@ cache, and an LRU cache of experts. All of it stays under one hard cap, `--ram-g
 (default 7): the expert cache gets what is left after the rest is reserved, and the
 engine refuses to start if the plan does not fit.
 
-## New in v0.6: chat server
+## New in v0.7: Qwen3.6-35B-A3B
+
+- **Qwen3.5/3.6-MoE support** (Qwen3.6-35B-A3B, Qwen3.5-35B-A3B), text part. Three of
+  every four layers are **Gated DeltaNet**: a recurrent layer with a fixed-size state
+  (about 2 MB per layer) instead of a KV cache, so its cost per token does not grow with
+  the conversation. Every fourth layer is **gated full attention** (RoPE on 64 of 256 dims,
+  output gate). Every layer's MoE has a **shared expert** (in RAM) next to the 8 routed
+  experts (streamed from the SSD, 256 per layer, 1.77 MB each at 4.5 bits).
+- **Conversation reuse with DeltaNet**: its state cannot be cut back like a KV cache, so
+  the engine keeps one snapshot at the end of each prompt. Continuing a chat and asking
+  the same message again reuse memory; a different conversation is read from the start.
+- **Tokenizer**: Qwen3.5/3.6's split rule (combining marks stay with letters, which
+  matters for Indic and other scripts) and **NFC normalization** (both families); the rule
+  is chosen from the model's own tokenizer.json.
+- **Sampling defaults** from the model card, including Qwen3.6's presence penalty (1.5);
+  `presence_penalty` is accepted by the API for any model.
+- **Longer default context for Qwen3.6** (16,384 tokens): only 10 of its 40 layers keep a
+  KV cache, about 20 KB per token.
+- `--perplexity text.txt`: quality check of the whole chain on real text.
+  `--bench-prompt N --bench-text f`: the benchmark prompt, built by the engine itself.
+- Tests: an independent reference that reads the Hugging Face checkpoint directly
+  (`trace/qwen35_ref.py`) agrees with the pack reference to float32 rounding; the engine
+  matches the pack reference and gives bit-identical output across all 13 settings.
+
+## v0.6: chat server
 
 - `--serve --tokenizer tokenizer.json`: one server with a **chat page** at `/` and an
   **OpenAI-compatible API** at `/v1/chat/completions` (streaming and not), `/v1/models`,

@@ -1,0 +1,44 @@
+== engine self-test (tiny models, checks correctness on this CPU)
+ENGINE TEST PASSED
+
+== Qwen3-30B-A3B, 4-bit attention pack, 1 drive
+model: Qwen3-MoE, 48 layers, 128 experts (top-8), hidden 2048, vocab 151936 | kernels: SSE (SSSE3+SSE4.1) | threads 4 | io threads 4
+RAM (cap 7.0 GB): dense weights 0.73 + expert cache 5.56 (with huge pages) + conversation memory for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.65 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 173.23s (2.96 tok/s) | decode: 128 tokens in 47.14s (2.69 tok/s)
+decode per token: SSD read 180 MB (0.49 GB/s over the decode time)
+decode time per token: attention 122 ms, experts 202 ms (of which waiting for SSD ~99 ms), routers 24.5 ms, output head 21 ms
+expert blocks used: 53279 | from cache 79.0% | guessed, arrived in time 15.0% | still being read when needed 6.0% | not predicted at all 3.2%
+heat: peak CPU 88C, peak SSD 38C, paused 0.0s
+SSD: 13291 reads, 35.28 GB, 0.21 GB/s per read thread while reading | guesses 11574: used 82%, withdrawn 0%, dropped late 0% | evictions 11196 (forced 0) | cache in use 5.56 GB
+
+== Qwen3-30B-A3B, 8-bit attention pack, 1 drive
+model: Qwen3-MoE, 48 layers, 128 experts (top-8), hidden 2048, vocab 151936 | kernels: SSE (SSSE3+SSE4.1) | threads 4 | io threads 4
+RAM (cap 7.0 GB): dense weights 1.42 + expert cache 4.87 (with huge pages) + conversation memory for 4096 tokens 0.40 + other 0.30 = 7.00 GB | expert block 2.95 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 152.73s (3.35 tok/s) | decode: 128 tokens in 58.60s (2.17 tok/s)
+decode per token: SSD read 283 MB (0.61 GB/s over the decode time)
+decode time per token: attention 149 ms, experts 255 ms (of which waiting for SSD ~163 ms), routers 21.4 ms, output head 34 ms
+expert blocks used: 53289 | from cache 73.5% | guessed, arrived in time 16.1% | still being read when needed 10.4% | not predicted at all 4.3%
+heat: peak CPU 88C, peak SSD 38C, paused 0.0s
+SSD: 16875 reads, 49.77 GB, 0.31 GB/s per read thread while reading | guesses 14571: used 81%, withdrawn 0%, dropped late 0% | evictions 15222 (forced 0) | cache in use 4.87 GB
+
+== Qwen3.6-35B-A3B, 8-bit dense pack, 1 drive
+model: Qwen3.5/3.6-MoE, 40 layers (30 DeltaNet + 10 attention), shared expert, 256 experts (top-8), hidden 2048, vocab 248320 | kernels: SSE (SSSE3+SSE4.1) | threads 4 | io threads 4
+RAM (cap 7.0 GB): dense weights 2.26 + expert cache 3.88 (with huge pages) + conversation memory for 16384 tokens 0.47 + other 0.40 = 7.00 GB | expert block 1.77 MB | SSD reads: direct (no OS cache)
+heat guard: pause above CPU 90C / SSD 70C (1 CPU, 2 SSD sensors)
+prefill: 512 tokens in 165.91s (3.09 tok/s) | decode: 128 tokens in 53.24s (2.39 tok/s)
+decode per token: SSD read 136 MB (0.32 GB/s over the decode time)
+decode time per token: attention 191 ms, experts 136 ms (of which waiting for SSD ~66 ms), routers 32.7 ms, output head 57 ms
+expert blocks used: 48086 | from cache 70.6% | guessed, arrived in time 24.6% | still being read when needed 4.9% | not predicted at all 5.9%
+heat: peak CPU 85C, peak SSD 37C, paused 0.0s
+SSD: 17749 reads, 31.41 GB, 0.32 GB/s per read thread while reading | guesses 14934: used 76%, withdrawn 0%, dropped late 0% | evictions 15559 (forced 0) | cache in use 3.88 GB
+
+== perplexity on trace/corpus.txt (1024 tokens): qwen3-q4b-d4.moe
+perplexity 7.878 over 1023 tokens of /kit/trace/corpus.txt (327 s)
+
+== perplexity on trace/corpus.txt (1024 tokens): qwen3-30b-a3b.moe
+perplexity 7.372 over 1023 tokens of /kit/trace/corpus.txt (379 s)
+
+== perplexity on trace/corpus.txt (1024 tokens): qwen3.6-35b-a3b.moe
+(still running when this file was saved)

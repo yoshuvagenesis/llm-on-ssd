@@ -5,8 +5,10 @@
 #   MODELS=/volume1/moe sh docker/serve.sh
 #
 # Settings (environment variables):
-#   MODELS    folder with the pack and tokenizer.json        (default /volume1/moe)
+#   MODELS    folder with the pack and its tokenizer          (default /volume1/moe)
 #   PACK      pack file name                                 (default qwen3-q4b-d4.moe)
+#   TOKENIZER the model's tokenizer.json, in MODELS           (default tokenizer.json;
+#             for Qwen3.6 use its own file, e.g. tokenizer-qwen3.6.json)
 #   MIRROR    optional folder on a second SSD with a copy of the same pack
 #   PORT      port for the web page and API                  (default 8080)
 #   PASSWORD  optional password for the page and API
@@ -14,14 +16,15 @@
 # Extra arguments go to the engine, e.g.  sh docker/serve.sh --max-context 8192
 MODELS=${MODELS:-/volume1/moe}
 PACK=${PACK:-qwen3-q4b-d4.moe}
+TOKENIZER=${TOKENIZER:-tokenizer.json}
 PORT=${PORT:-8080}
 RAM_GB=${RAM_GB:-7}
 
-if [ ! -f "$MODELS/$PACK" ] || [ ! -f "$MODELS/tokenizer.json" ]; then
-  echo "error: $MODELS needs $PACK and tokenizer.json (the model's own, from its Hugging Face folder)"
+if [ ! -f "$MODELS/$PACK" ] || [ ! -f "$MODELS/$TOKENIZER" ]; then
+  echo "error: $MODELS needs $PACK and $TOKENIZER (the model's own tokenizer.json, from its Hugging Face folder)"
   exit 1
 fi
-set -- --pack "/models/$PACK" --tokenizer /models/tokenizer.json --serve --ram-gb "$RAM_GB" "$@"
+set -- --pack "/models/$PACK" --tokenizer "/models/$TOKENIZER" --serve --ram-gb "$RAM_GB" "$@"
 mirror_mount=""
 if [ -n "$MIRROR" ]; then
   mirror_mount="-v $MIRROR:/models2"

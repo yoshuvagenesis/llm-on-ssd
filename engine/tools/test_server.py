@@ -23,6 +23,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "trace"))
+import qwen35_ref  # noqa: E402
 import selftest  # noqa: E402
 import test_tokenizer as tt  # noqa: E402
 
@@ -44,7 +45,7 @@ def free_port():
     return p
 
 
-def build(d):
+def build(d, arch="qwen3"):
     corpus = open(os.path.join(HERE, "..", "..", "trace", "corpus.txt"), encoding="utf-8").read()
     merges = tt.train(tt.TEXTS + [corpus[:8000]], 600)
     vocab = {tt.B2U[b]: b for b in range(256)}
@@ -55,13 +56,20 @@ def build(d):
     tj = {
         "added_tokens": [{"id": i, "content": s, "special": True} for s, i in sp.items()],
         "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-            {"type": "Split", "pattern": {"Regex": tt.QWEN}, "behavior": "Isolated", "invert": False},
+            {"type": "Split", "pattern": {"Regex": tt.QWEN35 if arch == "qwen35" else tt.QWEN},
+             "behavior": "Isolated", "invert": False},
             {"type": "ByteLevel"}]},
         "model": {"type": "BPE", "vocab": vocab, "merges": [[a, b] for a, b in merges]},
     }
     json.dump(tj, open(os.path.join(d, "tokenizer.json"), "w", encoding="utf-8"), ensure_ascii=False)
     V = len(vocab) + len(special)
     V += (-V) % 32
+    if arch == "qwen35":
+        qwen35_ref.build(d, np.random.default_rng(3), dict(qwen35_ref.TEXT, vocab_size=V, eos_token_id=sp["<|im_end|>"]))
+        pack = os.path.join(d, "tiny.moe")
+        subprocess.run([sys.executable, os.path.join(HERE, "convert.py"), "--model", d, "--out", pack],
+                       check=True, stdout=subprocess.DEVNULL)
+        return pack, os.path.join(d, "tokenizer.json")
     selftest.CFG.clear()
     selftest.CFG.update(dict(hidden_size=128, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
                              head_dim=32, num_experts=16, num_experts_per_tok=4, moe_intermediate_size=64,
@@ -143,6 +151,12 @@ class Server:
         self.p.wait(timeout=10)
 
 
+def V_of(pack):
+    sys.path.insert(0, HERE)
+    import packfmt
+    return packfmt.Pack(pack).ci("vocab_size")
+
+
 def cli(pack, tok, text, n):
     out = subprocess.run([ENGINE, "--pack", pack, "--tokenizer", tok, "--prompt", text, "--max-new", str(n),
                           "--quiet", "--threads", "2"], capture_output=True, check=True).stdout
@@ -150,8 +164,16 @@ def cli(pack, tok, text, n):
 
 
 def main():
+    for arch in ("qwen3", "qwen35"):
+        print(f"===== {'Qwen3-MoE' if arch == 'qwen3' else 'Qwen3.5/3.6-MoE (DeltaNet)'}")
+        run(arch)
+    print("SERVER TEST PASSED" if not FAILS else "SERVER TEST FAILED: " + ", ".join(FAILS))
+    sys.exit(1 if FAILS else 0)
+
+
+def run(arch):
     with tempfile.TemporaryDirectory() as d:
-        pack, tok = build(d)
+        pack, tok = build(d, arch)
         s = Server(pack, tok)
         try:
             print("1) page, models, stats")
@@ -169,7 +191,7 @@ def main():
             ans1 = r1["choices"][0]["message"]["content"]
             check("non-streaming answer", st == 200 and r1["usage"]["completion_tokens"] >= 1, str(r1)[:200])
             want = cli(pack, tok, msg[0]["content"], 12)
-            want_c = want.split("<|im_end|>")[0].rstrip("\n").lstrip()
+            want_c = want.split("<|im_end|>")[0].split("<|endoftext|>")[0].rstrip("\n").lstrip()
             check("greedy answer equals terminal mode", ans1 == want_c, f"{ans1!r} vs {want_c!r}")
             content, comments, events = s.stream(msg, max_tokens=12)
             check("streaming equals non-streaming", content == ans1, f"{content!r} vs {ans1!r}")
@@ -188,6 +210,9 @@ def main():
             r_again = [int(c.split()[3]) for c in comm_again if c.startswith(": reading")][0]
             check("reused conversation gives the same answer as reading it again",
                   content2 == full == again and r_again < r_full, f"{content2!r} / {full!r} / {again!r}")
+            if arch == "qwen35":
+                total = [int(c.split()[3]) for c in comm_again if c.startswith(": reading")][0]
+                check("same message again resumes from the snapshot (reads 1 token)", total == 1, str(comm_again[:2]))
 
             print("4) queue, stop")
             results = {}
@@ -219,6 +244,11 @@ def main():
             check("old messages are dropped when the context is full", any(c.startswith(": dropped") for c in comments3))
             st, r = s.chat([{"role": "user", "content": "Think about it"}], max_tokens=6, think=True)
             check("thinking mode answers", st == 200)
+            if arch == "qwen35":
+                st, r = s.chat([{"role": "user", "content": "  padded message  "}], max_tokens=4)
+                st2, r2 = s.chat([{"role": "user", "content": "padded message"}], max_tokens=4)
+                check("message text is trimmed like Qwen3.5's template",
+                      r["choices"][0]["message"]["content"] == r2["choices"][0]["message"]["content"])
             st, r = s.req("POST", "/v1/chat/completions", {"messages": []})
             check("empty request is refused", st == 400)
             st, js = s.req("GET", "/api/stats")
@@ -227,7 +257,25 @@ def main():
         finally:
             s.close()
 
-        print("6) password")
+        print("6) perplexity check")
+        text = open(os.path.join(HERE, "..", "..", "trace", "corpus.txt"), encoding="utf-8").read()[:3000]
+        tf = os.path.join(d, "t.txt")
+        open(tf, "w", encoding="utf-8").write(text)
+        out = subprocess.run([ENGINE, "--pack", pack, "--tokenizer", tok, "--perplexity", tf, "--max-tokens", "300",
+                              "--threads", "2"], capture_output=True, text=True, check=True).stdout
+        ppl = float(out.split()[1])
+        ids = subprocess.run([ENGINE, "--tokenizer", tok, "--tokenize", tf], capture_output=True, text=True,
+                             check=True).stdout.strip().split(",")[:300]
+        lg = os.path.join(d, "lg.bin")
+        subprocess.run([ENGINE, "--pack", pack, "--prompt-ids", ",".join(ids), "--max-new", "1", "--dump-logits", lg,
+                        "--threads", "2", "--quiet"], capture_output=True, check=True)
+        L = np.fromfile(lg, np.float32).reshape(-1, selftest.CFG["vocab_size"] if arch == "qwen3" else V_of(pack))[:len(ids) - 1]
+        L = L.astype(np.float64)
+        lse = L.max(1) + np.log(np.exp(L - L.max(1, keepdims=True)).sum(1))
+        want = float(np.exp(np.mean(lse - L[np.arange(len(ids) - 1), [int(x) for x in ids[1:]]])))
+        check("perplexity matches a separate calculation from the logits", abs(ppl - want) / want < 1e-4, f"{ppl} vs {want}")
+
+        print("7) password")
         s = Server(pack, tok, ["--password", "secret"])
         try:
             st, _ = s.req("GET", "/v1/models")
@@ -238,9 +286,6 @@ def main():
             check("page loads without the password (it asks for it)", st == 200)
         finally:
             s.close()
-
-    print("SERVER TEST PASSED" if not FAILS else "SERVER TEST FAILED: " + ", ".join(FAILS))
-    sys.exit(1 if FAILS else 0)
 
 
 if __name__ == "__main__":
