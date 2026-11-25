@@ -40,6 +40,8 @@ pub struct Config {
     pub lin: LinCfg,        // DeltaNet sizes (Qwen3.5/3.6)
     pub shared_ffn: usize,  // shared expert width (0 = none)
     pub think_open: bool,   // chat format opens "<think>\n" itself when thinking is on
+    pub no_think: bool,     // model's own chat template has no thinking mode at all (e.g. Coder-Instruct);
+                             // missing key defaults to false so existing packs keep today's behavior
 }
 
 #[derive(Clone, Copy, Default)]
@@ -446,6 +448,7 @@ impl Model {
             lin,
             shared_ffn: opt("shared_ffn"),
             think_open: opt("think_open") != 0,
+            no_think: opt("no_think") != 0,
         })
     }
 

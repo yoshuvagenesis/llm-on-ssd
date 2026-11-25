@@ -57,6 +57,19 @@ def build_vocab(model_dir, vocab_size):
     return out
 
 
+def supports_thinking(model_dir):
+    """Qwen3 chat models can toggle a <think>...</think> reasoning block; some fine-tunes
+    (e.g. Qwen3-Coder-Instruct) never trained on it at all, so the engine must not insert an
+    empty one of its own -- that out-of-distribution sequence can derail generation entirely.
+    We ask the model's own chat_template, not its name: if "<think>" never appears there, this
+    model's template has no concept of a thinking block."""
+    tp = os.path.join(model_dir, "tokenizer_config.json")
+    if not os.path.exists(tp):
+        return True  # unknown: keep today's behavior rather than silently changing it
+    template = json.load(open(tp)).get("chat_template", "")
+    return "<think>" in template
+
+
 def eos_ids(model_dir, cfg):
     ids = None
     gp = os.path.join(model_dir, "generation_config.json")
@@ -215,7 +228,8 @@ def main():
             "num_experts_per_tok": cfg["num_experts_per_tok"], "moe_intermediate_size": F,
             "rms_norm_eps": cfg["rms_norm_eps"], "rope_theta": cfg["rope_theta"], "vocab_size": V,
             "norm_topk_prob": int(cfg.get("norm_topk_prob", True)),
-            "eos": ",".join(map(str, eos_ids(args.model, cfg))) or "-1", "expert_fmt": args.expert_fmt, **extra}
+            "eos": ",".join(map(str, eos_ids(args.model, cfg))) or "-1", "expert_fmt": args.expert_fmt,
+            "no_think": int(not supports_thinking(args.model)), **extra}
     lines += [f"cfg {k} {v}" for k, v in cfgv.items()]
     placed = []
     for name, fmt, rows, cols, load in items:

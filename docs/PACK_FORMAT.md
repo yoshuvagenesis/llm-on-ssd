@@ -36,6 +36,7 @@ vocab <offset> <nbytes>                            the vocabulary blob
 | `norm_topk_prob` | `1` if the top-k router probabilities are renormalized to sum to 1 |
 | `eos` | Comma-separated end-of-sequence token ids (`-1` if none) |
 | `expert_fmt` | `q4b` or `q4` (format of the expert blocks; `q4` if absent) |
+| `no_think` | `1`: this model's own chat template has no `<think>` block at all (e.g. Coder-Instruct fine-tunes) -- the engine must not insert an empty one; `0`/absent: today's behavior (insert `<think>\n\n</think>\n\n` unless `--think`) |
 
 Qwen3.5/3.6 packs add:
 

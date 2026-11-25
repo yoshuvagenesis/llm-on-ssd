@@ -165,7 +165,11 @@ struct Special {
 fn render(e: &Engine, sp: &Special, ctx: &Ctx, msgs: &[(String, String)], think: bool) -> Vec<u32> {
     let t = &e.tok;
     let nl = t.encode("\n", false);
-    let empty_think = t.encode("<think>\n\n</think>\n\n", true);
+    // A model with no thinking mode at all (e.g. Coder-Instruct) never gets the empty
+    // "<think></think>" pair, in history or in the current turn: it was never trained on
+    // that sequence, and inserting it can derail generation entirely.
+    let no_think_model = e.m.cfg.no_think;
+    let empty_think = if no_think_model { Vec::new() } else { t.encode("<think>\n\n</think>\n\n", true) };
     // Qwen3.5/3.6's template trims message text and opens "<think>\n" itself when thinking
     let q35 = e.m.cfg.think_open;
     let mut ids = Vec::new();
@@ -176,7 +180,9 @@ fn render(e: &Engine, sp: &Special, ctx: &Ctx, msgs: &[(String, String)], think:
         if role == "assistant" {
             // the model saw an empty thinking block before its answer (thinking off), so
             // history repeats it; the exact generated tokens are reused when known
-            ids.extend(&empty_think);
+            if !empty_think.is_empty() {
+                ids.extend(&empty_think);
+            }
             match ctx.answers.iter().find(|(s, _)| s.as_str() == content) {
                 Some((_, a)) => ids.extend(a),
                 None => ids.extend(t.encode(content, false)),
@@ -190,7 +196,9 @@ fn render(e: &Engine, sp: &Special, ctx: &Ctx, msgs: &[(String, String)], think:
     ids.push(sp.im_start);
     ids.extend(t.encode("assistant\n", false));
     if !think {
-        ids.extend(&empty_think);
+        if !empty_think.is_empty() {
+            ids.extend(&empty_think);
+        }
     } else if q35 {
         ids.extend(t.encode("<think>\n", true));
     }

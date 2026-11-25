@@ -13,6 +13,8 @@
 //!
 //! Options
 //!   --prompt "text"        one user message (the model's chat format); --think lets it reason first
+//!                          (models with no thinking mode at all, per the pack's "no_think" flag,
+//!                          get no <think> tags either way, and --think is refused for them)
 //!   --bench-prompt N --bench-text f   benchmark prompt of exactly N tokens: "Summarize this text:"
 //!                          and the start of text file f, in the chat format (as tools/make_prompt.py)
 //!   --prompt-ids a,b,c | --prompt-file f   prompt token ids (comma/space separated)
@@ -236,14 +238,22 @@ fn main() {
     // default context: Qwen3.6's KV cache is small (only every 4th layer has one), so it
     // gets a longer default conversation for about the same RAM
     let max_ctx = max_ctx_arg.unwrap_or(if mcfg.qwen35 { 16384 } else { 4096 });
+    if flag("--think") && mcfg.no_think {
+        eprintln!("--think: this pack's model has no thinking mode (no_think=1); drop --think");
+        std::process::exit(1);
+    }
     if let Some(text) = &prompt_text {
-        // one user message in the model's chat format; thinking off unless --think
+        // one user message in the model's chat format; thinking off unless --think.
+        // A model with no thinking mode at all (mcfg.no_think) never gets <think> tags:
+        // inserting the empty pair it was never trained on can derail generation entirely.
         let t = tok.as_ref().unwrap();
         prompt = t.encode("<|im_start|>user\n", true);
         prompt.extend(t.encode(if mcfg.think_open { text.trim() } else { text }, false));
         prompt.extend(t.encode("<|im_end|>\n<|im_start|>assistant\n", true));
         if !flag("--think") {
-            prompt.extend(t.encode("<think>\n\n</think>\n\n", true));
+            if !mcfg.no_think {
+                prompt.extend(t.encode("<think>\n\n</think>\n\n", true));
+            }
         } else if mcfg.think_open {
             prompt.extend(t.encode("<think>\n", true));
         }
@@ -252,7 +262,10 @@ fn main() {
         let t = tok.as_ref().unwrap();
         let text = std::fs::read_to_string(arg(&args, "--bench-text").unwrap()).expect("cannot read --bench-text");
         let head = t.encode("<|im_start|>user\nSummarize this text:\n\n", true);
-        let tail = t.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", true);
+        let tail = t.encode(
+            if mcfg.no_think { "<|im_end|>\n<|im_start|>assistant\n" } else { "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" },
+            true,
+        );
         let body = t.encode(&text, true);
         let need = n.saturating_sub(head.len() + tail.len());
         if need == 0 || body.len() < need {

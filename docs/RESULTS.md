@@ -191,3 +191,32 @@ On the N5105, generation speed with the 4-bit attention pack and one SSD:
 Earlier versions were tuned on a 2-core cloud VM with a random-weight pack of the real
 shape (`engine/tools/make_bench_pack.py`). Those numbers are in
 [engine/README.md](../engine/README.md) and are not comparable with the N5105.
+
+### v0.8, on a different machine: a laptop, single-channel RAM
+
+Tested with `Qwen3-Coder-30B-A3B-Instruct` on an Intel Core i5-1235U laptop (10 cores/12
+threads, hybrid P+E, AVX2+FMA), one NVMe SSD on a PCIe 3.0 x4 link, NVIDIA MX550 (unused;
+the engine has no GPU path). Not comparable to the N5105 numbers above; noted here because
+two of the findings are specific to this class of hardware, not to the engine:
+
+- **Fixed a real bug**: the engine inserted an empty `<think>\n\n</think>\n\n` block for
+  every chat/prompt run that didn't ask for `--think`. Qwen3-Coder-Instruct's own chat
+  template has no concept of thinking at all, so that sequence is out-of-distribution for
+  it, and the model emitted `<|endoftext|>` as its first token instead of answering. Fixed
+  by detecting thinking support per model (from its `chat_template`) instead of assuming
+  every Qwen3-architecture model has it; see the `v0.8` branch.
+- **Added AVX2 kernels** (`matvec`, `dot_bf16`, `axpy_bf16`, `matvec_f32`), alongside the
+  existing SSE ones. Correct (perplexity 9.33 either way) but the real-world speedup on
+  this machine was small, not the ~2x a wider SIMD width would suggest: `dmidecode` showed
+  only one of its two RAM slots populated, so it runs single-channel DDR4-3200. The
+  int8/q4b kernels' working set is well past L3 cache, so the bottleneck here is RAM
+  bandwidth, not CPU instruction throughput — AVX2 has nothing extra to work with on this
+  particular machine. Should still help on dual-channel hardware.
+- The CPU thermal guard was observed doing its job for real: a sustained run hit 93°C and
+  the engine correctly paused 11.2s, exactly as designed.
+
+**AI assistance.** The diagnosis and fixes above (isolating the thinking-block bug via a
+perplexity self-check, writing and testing the AVX2 kernels, and the single-channel-RAM
+finding) were done with the help of Claude Code, an AI coding assistant from Anthropic,
+under this project's own direction and review. Noted here rather than as a commit author,
+since the judgment, testing and final responsibility for the result are the author's.
